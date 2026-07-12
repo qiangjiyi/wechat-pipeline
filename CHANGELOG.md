@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 增加从本地已更新 Baoyu 仓库完整同步五个固定 Skill 快照的维护脚本。
+
 ### Protocol 2026-07-11-002
 
 - 将 publisher 网络退避从 Agent 提示词下沉到传输代码。

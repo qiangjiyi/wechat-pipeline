@@ -343,6 +343,7 @@ wechat-pipeline/
 │   ├── docs/                       # 运行协议
 │   └── third_party/                # 上游快照锁与 License
 ├── docs/                            # 维护决策
+├── scripts/                         # 上游 Skill 快照维护工具
 └── tests/                           # 结构、协议与 Publisher 测试
 ```
 
@@ -355,11 +356,55 @@ Baoyu Skill 源码来自 [JimLiu/baoyu-skills](https://github.com/JimLiu/baoyu-s
 1. Claude Code 与 Codex 一次安装即可运行，不依赖用户机器上是否存在其他版本。
 2. Skill 内容、reference 和脚本可通过 tree SHA-256 验证，避免上游更新静默改变流水线行为。
 
-升级快照时必须同步五个完整目录，并更新：
+### 同步上游更新
 
-- `plugins/wechat-pipeline/THIRD_PARTY_NOTICES.md`
-- `plugins/wechat-pipeline/third_party/baoyu-skills.lock.json`
-- 对应版本与 tree hash
+先使用本机的 Skill 更新工具拉取 Baoyu 源仓库，再运行本项目的同步器：
+
+```bash
+python3 scripts/sync_baoyu_skills.py --check
+python3 scripts/sync_baoyu_skills.py
+```
+
+默认源仓库路径：
+
+```text
+~/Workspace/downloads/skill-sources/baoyu-skills
+```
+
+其他维护者可以通过参数或环境变量指定已经更新且工作区干净的本地 clone：
+
+```bash
+python3 scripts/sync_baoyu_skills.py --source /path/to/baoyu-skills
+
+BAOYU_SKILLS_SOURCE=/path/to/baoyu-skills \
+  python3 scripts/sync_baoyu_skills.py
+```
+
+同步器不联网，也不执行 `git pull`。它会读取本地源仓库的 HEAD，逐个比较五个 Skill 的完整目录 hash；发生变化的目录会先复制到 staging 并校验，再整体替换，因此能同时处理上游新增、修改和删除的文件。
+
+同步成功后会自动：
+
+- 更新 `plugins/wechat-pipeline/third_party/baoyu-skills.lock.json` 中的 commit、Skill version 和 tree SHA-256
+- 更新 `plugins/wechat-pipeline/THIRD_PARTY_NOTICES.md` 中的上游 commit
+- 同步上游 License
+- 同时提高 Claude/Codex Plugin patch 版本
+- 在 `CHANGELOG.md` 记录同步 commit
+
+常用保护选项：
+
+```bash
+# 只显示预计变化
+python3 scripts/sync_baoyu_skills.py --dry-run
+
+# vendored 目录存在未提交修改时默认拒绝覆盖；确认丢弃后才使用
+python3 scripts/sync_baoyu_skills.py --force
+```
+
+升级快照后必须确认：
+
+1. `git diff` 只包含预期的上游变化和元数据更新。
+2. Claude/Codex manifest 版本保持一致。
+3. 全部测试与两个宿主的 manifest 验证通过。
 
 不要只替换单个 `SKILL.md`。
 
@@ -470,4 +515,3 @@ claude plugin validate --strict plugins/wechat-pipeline
 ## License
 
 本项目基于 [MIT License](LICENSE) 开源。
-
