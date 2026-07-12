@@ -1,0 +1,27 @@
+{
+  "repository": "https://github.com/JimLiu/baoyu-skills",
+  "commit": "6b7a2e417500561a5ecdd0b168332f4142584617",
+  "license": "MIT",
+  "skills": {
+    "baoyu-format-markdown": {
+      "version": "1.57.0",
+      "tree_sha256": "a8e48b6e054f999dbf08594f6fcdbc1362a2737fc5b28db6f8a6564d041ca5d7"
+    },
+    "baoyu-xhs-images": {
+      "version": "2.0.1",
+      "tree_sha256": "6a8101cf51a543a5645eb1fad13655418cf16c5c5814ec0f7b3a20aa18d3d8af"
+    },
+    "baoyu-cover-image": {
+      "version": "1.117.5",
+      "tree_sha256": "e285235edaa2167a2f39baac0f5ba854960485c0d9082be699a3c2ea2a464b30"
+    },
+    "baoyu-article-illustrator": {
+      "version": "1.117.4",
+      "tree_sha256": "c556a1c47589edd604043b3f006c6935f1501a2d943c5de3e49a5053c7365099"
+    },
+    "baoyu-image-gen": {
+      "version": "2.1.0",
+      "tree_sha256": "0a2db24b2050540fdc82b3c577676e16a09c0e0687e292d51abb7afae87356ed"
+    }
+  }
+}

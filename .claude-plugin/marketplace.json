@@ -1,0 +1,16 @@
+{
+  "name": "jiyi-plugins",
+  "description": "Claude Code plugins for WeChat content production and publishing workflows.",
+  "owner": {
+    "name": "jiyi"
+  },
+  "plugins": [
+    {
+      "name": "wechat-pipeline",
+      "source": "./plugins/wechat-pipeline",
+      "description": "End-to-end WeChat Official Account draft pipeline with four coordinated agents.",
+      "category": "productivity",
+      "tags": ["wechat", "publishing", "agents"]
+    }
+  ]
+}

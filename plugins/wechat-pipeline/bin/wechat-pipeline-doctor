@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+PIPELINE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec python3 "${PIPELINE_ROOT}/scripts/plugin_doctor.py" "$@"

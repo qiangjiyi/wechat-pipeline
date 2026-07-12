@@ -1,0 +1,20 @@
+{
+  "name": "jiyi-plugins",
+  "interface": {
+    "displayName": "Jiyi Plugins"
+  },
+  "plugins": [
+    {
+      "name": "wechat-pipeline",
+      "source": {
+        "source": "local",
+        "path": "./plugins/wechat-pipeline"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

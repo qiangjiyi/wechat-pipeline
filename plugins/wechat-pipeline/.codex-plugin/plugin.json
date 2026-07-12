@@ -1,0 +1,38 @@
+{
+  "name": "wechat-pipeline",
+  "version": "0.1.0",
+  "description": "End-to-end WeChat Official Account draft pipeline with multi-agent formatting, pinned Baoyu image generation, validation, and publishing.",
+  "author": {
+    "name": "jiyi",
+    "url": "https://github.com/qiangjiyi"
+  },
+  "homepage": "https://github.com/qiangjiyi/wechat-pipeline",
+  "repository": "https://github.com/qiangjiyi/wechat-pipeline",
+  "license": "MIT",
+  "keywords": [
+    "wechat",
+    "official-account",
+    "publishing",
+    "multi-agent",
+    "workflow"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "WeChat Publishing Pipeline",
+    "shortDescription": "Format, illustrate, validate, and publish WeChat drafts.",
+    "longDescription": "Runs a controlled multi-agent workflow from source text through native Baoyu image generation and WeChat Official Account draft creation.",
+    "developerName": "jiyi",
+    "category": "Productivity",
+    "capabilities": [
+      "Multi-agent workflow",
+      "Image generation",
+      "WeChat draft publishing"
+    ],
+    "defaultPrompt": [
+      "把这篇内容制作成微信贴图并发布到公众号草稿箱。",
+      "把这篇 Markdown 排版、配图并发布到公众号草稿箱。",
+      "检查微信发布流水线的本地配置。"
+    ],
+    "brandColor": "#07C160"
+  }
+}
