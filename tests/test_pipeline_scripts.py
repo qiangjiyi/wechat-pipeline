@@ -98,6 +98,77 @@ class PipelineScriptTests(unittest.TestCase):
             resumed = self.run_script("run_context.py", "status", run_dir, "planning")
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
 
+    def test_news_layout_status_sequence_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("# Article\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init",
+                "--mode", "news",
+                "--account", "xiyue",
+                "--slug", "layout-status",
+                "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            run_dir = json.loads(created.stdout)["run_dir"]
+            for status in ("planning", "ready", "typesetting", "layout_ready", "publishing", "published"):
+                result = self.run_script("run_context.py", "status", run_dir, status)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_article_source_is_created_once_and_reused_after_designer_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("# Article\n\nBody.\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init",
+                "--mode", "news",
+                "--account", "xiyue",
+                "--slug", "article-source",
+                "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            run_dir = Path(json.loads(created.stdout)["run_dir"])
+            sealed = run_dir / ".pipeline" / "input.md"
+            prepared = self.run_script(
+                "prepare_article_source.py", str(run_dir), "--source", str(sealed)
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            payload = json.loads(prepared.stdout)
+            article_source = Path(payload["article_source_path"])
+            self.assertFalse(payload["reused"])
+            self.assertEqual(article_source.read_bytes(), sealed.read_bytes())
+            self.assertTrue(article_source.stat().st_mode & 0o200)
+
+            article_source.write_text(article_source.read_text() + "\n![](imgs/01.png)\n", encoding="utf-8")
+            resumed = self.run_script(
+                "prepare_article_source.py", str(run_dir), "--source", str(sealed)
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertTrue(json.loads(resumed.stdout)["reused"])
+            self.assertIn("imgs/01.png", article_source.read_text(encoding="utf-8"))
+
+    def test_article_source_rejects_input_outside_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("article\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init",
+                "--mode", "news",
+                "--account", "xiyue",
+                "--slug", "article-source-boundary",
+                "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            run_dir = json.loads(created.stdout)["run_dir"]
+            result = self.run_script(
+                "prepare_article_source.py", run_dir, "--source", str(source)
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("inside canonical_output_dir", result.stderr)
+
     def test_seal_rejects_mismatched_run_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -185,7 +256,7 @@ class PipelineScriptTests(unittest.TestCase):
         started = written - timedelta(seconds=5) if attempt_before_prompt else written + timedelta(seconds=1)
         finished = started + timedelta(seconds=1)
         run = {
-            "protocol_version": "2026-07-11-002",
+            "protocol_version": "2026-07-12-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "account": "xiyue",
@@ -198,7 +269,7 @@ class PipelineScriptTests(unittest.TestCase):
         verdict = "success" if status == "success" else "api_error"
         manifest = {
             "schema_version": 2,
-            "protocol_version": "2026-07-11-002",
+            "protocol_version": "2026-07-12-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "canonical_output_dir": str(run_dir),
@@ -331,6 +402,116 @@ class PipelineScriptTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1)
             self.assertIn("prompt_path must stay inside canonical_output_dir", result.stdout)
+
+    def make_layout(self, root: Path, *, placeholder: bool = False) -> tuple[Path, Path]:
+        source = root / "source.md"
+        source.write_text("# 标题\n\n正文。\n", encoding="utf-8")
+        created = self.run_script(
+            "run_context.py", "init",
+            "--mode", "news",
+            "--account", "xiyue",
+            "--slug", "layout",
+            "--source", str(source),
+            "--exports-root", str(root / "exports"),
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        run = json.loads(created.stdout)
+        run_dir = Path(run["run_dir"])
+        html_path = run_dir / "article-body.html"
+        visible = "{{作者名}}" if placeholder else "正文。"
+        html_path.write_text(
+            f'<section><p><span leaf="">{visible}</span></p></section>', encoding="utf-8"
+        )
+        cover = run_dir / "cover.png"
+        cover.write_bytes(PNG)
+        gzh = ROOT / "skills" / "gzh-design"
+        lock = json.loads(
+            (ROOT / "third_party" / "gzh-design.lock.json").read_text(encoding="utf-8")
+        )
+        original = run_dir / ".pipeline" / "input.md"
+        markdown = run_dir / "article-source.md"
+        markdown.write_bytes(original.read_bytes())
+        layout = {
+            "schema_version": 1,
+            "protocol_version": "2026-07-12-001",
+            "run_id": run["run_id"],
+            "mode": "news",
+            "canonical_output_dir": str(run_dir),
+            "source": {
+                "markdown_path": str(markdown),
+                "markdown_sha256": sha256(markdown),
+                "original_path": str(original),
+                "original_sha256": sha256(original),
+            },
+            "skill_contract": {
+                "skill_name": "gzh-design",
+                "skill_path": str(gzh / "SKILL.md"),
+                "skill_sha256": sha256(gzh / "SKILL.md"),
+                "tree_sha256": lock["tree_sha256"],
+                "files_read": [
+                    str(gzh / "SKILL.md"),
+                    str(gzh / "references" / "theme-index.md"),
+                    str(gzh / "references" / "theme-moyu-green.md"),
+                    str(gzh / "references" / "common-components.md"),
+                ],
+                "upstream_commit": lock["commit"],
+            },
+            "decision": {
+                "theme": "摸鱼绿",
+                "theme_source": "auto",
+                "article_type": "观点/深度分析",
+                "content_policy": "preserve-visible-text",
+            },
+            "metadata": {
+                "title": "标题",
+                "author": "",
+                "summary": "正文摘要",
+                "cover_path": str(cover),
+            },
+            "output": {
+                "html_path": str(html_path),
+                "html_sha256": sha256(html_path),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        manifest = run_dir / ".pipeline" / "layout.json"
+        manifest.write_text(json.dumps(layout), encoding="utf-8")
+        return html_path, manifest
+
+    def test_layout_validator_accepts_valid_gzh_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            html_path, manifest = self.make_layout(Path(temp))
+            result = self.run_script(
+                "validate_article_layout.py", str(html_path), "--manifest", str(manifest)
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["warnings"], [])
+
+    def test_layout_validator_rejects_unresolved_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            html_path, manifest = self.make_layout(Path(temp), placeholder=True)
+            result = self.run_script(
+                "validate_article_layout.py", str(html_path), "--manifest", str(manifest)
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("unresolved placeholder", result.stdout)
+
+    def test_layout_validator_rejects_missing_source_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            html_path, manifest = self.make_layout(Path(temp))
+            html_path.write_text(
+                '<section><p><span leaf="">另一段内容。</span></p></section>', encoding="utf-8"
+            )
+            layout = json.loads(manifest.read_text(encoding="utf-8"))
+            layout["output"]["html_sha256"] = sha256(html_path)
+            manifest.write_text(json.dumps(layout), encoding="utf-8")
+            result = self.run_script(
+                "validate_article_layout.py", str(html_path), "--manifest", str(manifest)
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("source text segments", result.stdout)
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ class PluginStructureTests(unittest.TestCase):
         self.assertEqual(codex_entry["policy"]["authentication"], "ON_USE")
 
     def test_agents_use_plugin_layout_and_tool_boundaries(self) -> None:
-        expected = {"wechat-leader", "wechat-designer", "wechat-formatter", "wechat-publisher"}
+        expected = {"wechat-leader", "wechat-designer", "wechat-formatter", "wechat-typesetter", "wechat-publisher"}
         found = set()
         for path in (ROOT / "agents").glob("*.md"):
             data = frontmatter(path)
@@ -71,6 +71,7 @@ class PluginStructureTests(unittest.TestCase):
             "baoyu-cover-image",
             "baoyu-article-illustrator",
             "baoyu-image-gen",
+            "gzh-design",
         }
         found = {
             frontmatter(path)["name"]
@@ -81,6 +82,7 @@ class PluginStructureTests(unittest.TestCase):
         self.assertIn("wechat-pipeline:wechat-leader", coordinator)
         self.assertIn("Use Codex subagent tools", coordinator)
         self.assertIn("wechat-pipeline:baoyu-xhs-images", coordinator)
+        self.assertIn("wechat-pipeline:gzh-design", coordinator)
 
     def test_protocol_version_is_consistent_across_runtime_prompts(self) -> None:
         version_source = (ROOT / "scripts" / "protocol_version.py").read_text(encoding="utf-8")
@@ -98,10 +100,8 @@ class PluginStructureTests(unittest.TestCase):
             self.assertNotRegex(text, r"2026-07-11-00(?!2)\d", str(path))
 
         protocol = (ROOT / "docs" / "wechat-pipeline-protocol.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "input_sealed -> planning -> rendering -> ready -> publishing -> published",
-            protocol,
-        )
+        self.assertIn("newspic: input_sealed -> planning -> rendering -> ready -> publishing -> published", protocol)
+        self.assertIn("news:    input_sealed -> planning -> rendering -> ready -> typesetting -> layout_ready -> publishing -> published", protocol)
 
     def test_baoyu_snapshot_matches_lock(self) -> None:
         lock = json.loads(
@@ -125,6 +125,28 @@ class PluginStructureTests(unittest.TestCase):
                 digest.update(len(contents).to_bytes(8, "big"))
                 digest.update(contents)
             self.assertEqual(digest.hexdigest(), metadata["tree_sha256"], name)
+
+    def test_gzh_design_snapshot_matches_lock(self) -> None:
+        lock = json.loads(
+            (ROOT / "third_party" / "gzh-design.lock.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(lock["commit"], "ba1f4175519b481cb3566616c9e5178705067904")
+        skill_root = ROOT / "skills" / "gzh-design"
+        digest = hashlib.sha256()
+        for path in sorted(
+            path for path in skill_root.rglob("*")
+            if path.is_file()
+            and path.name != ".DS_Store"
+            and path.suffix != ".pyc"
+            and "__pycache__" not in path.parts
+        ):
+            relative = path.relative_to(skill_root).as_posix().encode()
+            contents = path.read_bytes()
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            digest.update(len(contents).to_bytes(8, "big"))
+            digest.update(contents)
+        self.assertEqual(digest.hexdigest(), lock["tree_sha256"])
 
     def test_repository_is_portable_and_contains_no_runtime_secrets(self) -> None:
         checked_suffixes = {".md", ".py", ".json", ".mjs", ".sh"}

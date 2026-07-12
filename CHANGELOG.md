@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 原样纳入固定版本的 `gzh-design-skill`，新增独立公众号 HTML 排版阶段和校验门禁。
+- Publisher 新增已排版 HTML 输入通道，保留现有正文图上传、封面素材和草稿 API 能力。
+- 流水线协议升级，增加 typesetter、layout manifest 与可恢复的排版状态。
 - 增加从本地已更新 Baoyu 仓库完整同步五个固定 Skill 快照的维护脚本。
 
 ### Protocol 2026-07-11-002

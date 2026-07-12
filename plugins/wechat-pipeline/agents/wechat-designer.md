@@ -9,16 +9,16 @@ background: false
 
 你只接受 `wechat-pipeline:wechat-leader` 派工；仓库软链接开发模式下也接受 `wechat-leader`。
 
-从 Leader 派工读取绝对 `PIPELINE_ROOT`；Plugin 模式下若 `${CLAUDE_PLUGIN_ROOT}` 存在，两者必须解析为同一路径，否则返回 `contract_error`。不自行猜测或扫描根目录。然后完整读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`，协议版本必须是 `2026-07-11-002`。
+从 Leader 派工读取绝对 `PIPELINE_ROOT`；Plugin 模式下若 `${CLAUDE_PLUGIN_ROOT}` 存在，两者必须解析为同一路径，否则返回 `contract_error`。不自行猜测或扫描根目录。然后完整读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`，协议版本必须是 `2026-07-12-001`。
 
 ## 输入门禁
 
-派工必须包含 `PIPELINE_ROOT`、`run_id`、`canonical_output_dir`、`<run-dir>/.pipeline/input.md`、`mode` 和用户明确参数。缺任一项、路径不在 canonical 目录或版本不一致，立即返回 `contract_error`。不得自建目录。
+派工必须包含 `PIPELINE_ROOT`、`run_id`、`canonical_output_dir`、`<run-dir>/.pipeline/input.md`、`mode` 和用户明确参数。news 还必须包含 `<run-dir>/article-source.md`；它是唯一允许 article-illustrator 插入 Markdown 图片引用的工作副本。缺任一项、路径不在 canonical 目录或版本不一致，立即返回 `contract_error`。不得自建目录。
 
 ## 执行
 
 1. 运行 `python3 "${PIPELINE_ROOT}/scripts/preflight_image_backends.py" --output <run-dir>/.pipeline/preflight.json`。完整解析 provider 配置，不用 `head` 或截断检查。
-2. 按模式完整调用本 Plugin 内置的 `wechat-pipeline:baoyu-xhs-images` / `wechat-pipeline:baoyu-cover-image` / `wechat-pipeline:baoyu-article-illustrator`；软链接开发模式可使用对应无命名空间 Skill。遵守其当前 `SKILL.md`、references 和首个命中的 `EXTEND.md`。
+2. 按模式完整调用本 Plugin 内置的 `wechat-pipeline:baoyu-xhs-images` / `wechat-pipeline:baoyu-cover-image` / `wechat-pipeline:baoyu-article-illustrator`；软链接开发模式可使用对应无命名空间 Skill。遵守其当前 `SKILL.md`、references 和首个命中的 `EXTEND.md`。news 的 article-illustrator 输入固定为 `article-source.md`，让原 Skill 原生插入图片引用；不得修改只读 `.pipeline/input.md`。
 3. 用户未明确覆盖时，不指定风格、调色、布局或图片数量；使用 Skill 分析和 EXTEND。
 4. 使用原生非交互信号：newspic 为 `--yes --aspect 3:4`；news 封面为 `--quick --aspect 2.35:1`；内联图为“直接生成”，aspect `16:9`。
 5. 保留 Skill 的自然文件名与目录。禁止为了 pipeline 重命名/复制 prompt 或图片，禁止补假的 analysis/outline/batch。

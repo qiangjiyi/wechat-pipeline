@@ -35,6 +35,8 @@ def _newspic_parser(parent: argparse.ArgumentParser) -> None:
 def _article_parser(parent: argparse.ArgumentParser) -> None:
     parent.add_argument("markdown_pos", nargs="?", help="Path to a markdown file (.md). Positional or use --markdown.")
     parent.add_argument("--markdown", dest="markdown", help="Path to a markdown file (.md). Same as the positional argument.")
+    parent.add_argument("--html", help="Path to a pre-typeset gzh-design HTML body fragment. Mutually exclusive with Markdown input.")
+    parent.add_argument("--layout-manifest", help="Pipeline .pipeline/layout.json to validate with --html.")
     parent.add_argument("--theme", help="Theme name: default | grace | simple | modern.")
     parent.add_argument("--color", help="Primary color preset (blue/green/...) or #hex.")
     parent.add_argument("--no-cite", action="store_true", help="Disable bottom-citation rewriting of ordinary external links.")
@@ -80,7 +82,7 @@ def _show_help() -> None:
         "\n"
         "Subcommands:\n"
         "  newspic    Image-text post (article_type=newspic)\n"
-        "  article    Markdown article (article_type=news) with themes/colors\n"
+        "  article    Markdown or validated gzh-design HTML article (article_type=news)\n"
         "\n"
         "Run `publish.py <subcommand> --help` for subcommand-specific options.\n"
     )

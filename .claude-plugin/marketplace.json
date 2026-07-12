@@ -8,7 +8,7 @@
     {
       "name": "wechat-pipeline",
       "source": "./plugins/wechat-pipeline",
-      "description": "End-to-end WeChat Official Account draft pipeline with four coordinated agents.",
+      "description": "End-to-end WeChat Official Account draft pipeline with five coordinated agents and gzh-design typesetting.",
       "category": "productivity",
       "tags": ["wechat", "publishing", "agents"]
     }

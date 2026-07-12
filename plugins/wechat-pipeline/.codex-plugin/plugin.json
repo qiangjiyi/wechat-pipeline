@@ -1,7 +1,7 @@
 {
   "name": "wechat-pipeline",
-  "version": "0.1.0",
-  "description": "End-to-end WeChat Official Account draft pipeline with multi-agent formatting, pinned Baoyu image generation, validation, and publishing.",
+  "version": "0.2.0",
+  "description": "End-to-end WeChat Official Account draft pipeline with multi-agent formatting, pinned Baoyu image generation, gzh-design typesetting, validation, and publishing.",
   "author": {
     "name": "jiyi",
     "url": "https://github.com/qiangjiyi"
@@ -20,12 +20,13 @@
   "interface": {
     "displayName": "WeChat Publishing Pipeline",
     "shortDescription": "Format, illustrate, validate, and publish WeChat drafts.",
-    "longDescription": "Runs a controlled multi-agent workflow from source text through native Baoyu image generation and WeChat Official Account draft creation.",
+    "longDescription": "Runs a controlled multi-agent workflow from source text through native Baoyu image generation, gzh-design HTML typesetting, and WeChat Official Account draft creation.",
     "developerName": "jiyi",
     "category": "Productivity",
     "capabilities": [
       "Multi-agent workflow",
       "Image generation",
+      "WeChat HTML typesetting",
       "WeChat draft publishing"
     ],
     "defaultPrompt": [

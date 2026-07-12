@@ -29,7 +29,9 @@ ALLOWED_STATUS_TRANSITIONS = {
     "input_sealed": {"planning", "failed", "cancelled"},
     "planning": {"rendering", "ready", "failed", "cancelled"},
     "rendering": {"ready", "failed", "cancelled"},
-    "ready": {"publishing", "failed", "cancelled"},
+    "ready": {"typesetting", "publishing", "failed", "cancelled"},
+    "typesetting": {"layout_ready", "failed", "cancelled"},
+    "layout_ready": {"publishing", "failed", "cancelled"},
     "publishing": {"published", "failed", "cancelled"},
     "failed": set(),
     "published": set(),
@@ -238,7 +240,7 @@ def main() -> int:
     status_parser.add_argument("run_dir", type=Path)
     status_parser.add_argument(
         "status",
-        choices=("awaiting_input", "input_sealed", "planning", "rendering", "ready", "publishing", "published", "failed", "cancelled"),
+        choices=("awaiting_input", "input_sealed", "planning", "rendering", "ready", "typesetting", "layout_ready", "publishing", "published", "failed", "cancelled"),
     )
     status_parser.set_defaults(func=set_status)
 

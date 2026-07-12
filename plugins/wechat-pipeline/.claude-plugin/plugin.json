@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "wechat-pipeline",
-  "version": "0.1.0",
-  "description": "End-to-end WeChat Official Account draft pipeline for Claude Code and Codex with coordinated formatting, pinned Baoyu image generation, validation, and publishing.",
+  "version": "0.2.0",
+  "description": "End-to-end WeChat Official Account draft pipeline with coordinated formatting, pinned Baoyu image generation, gzh-design typesetting, validation, and publishing.",
   "author": {
     "name": "jiyi"
   },

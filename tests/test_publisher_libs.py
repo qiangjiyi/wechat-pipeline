@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import sys
@@ -21,6 +22,7 @@ from lib.errors import PublishError  # noqa: E402
 from lib import proxy_client  # noqa: E402
 from lib.account import account_value, resolve_account  # noqa: E402
 from lib.env_loader import load_dotenv, merged_env  # noqa: E402
+from lib.html_article import inspect_html, rewrite_image_sources, upload_html_images  # noqa: E402
 from lib.source_loader import load_source, parse_markdown, parse_simple_yaml, validate_newspic_source  # noqa: E402
 import mode_article  # noqa: E402
 import mode_newspic  # noqa: E402
@@ -299,6 +301,225 @@ class PublisherInputTests(unittest.TestCase):
         )
         self.assertNotIn("WECHATIMGPH_1", rewritten)
         self.assertEqual(rewritten.count("https://mmbiz.example/image"), 2)
+
+    def test_gzh_html_inspection_rejects_documents_and_placeholders(self) -> None:
+        with self.assertRaisesRegex(PublishError, "body fragment"):
+            inspect_html("<html><body><section></section></body></html>")
+        with self.assertRaisesRegex(PublishError, "unresolved placeholder"):
+            inspect_html('<section><p><span leaf="">{{作者名}}</span></p></section>')
+        with self.assertRaisesRegex(PublishError, "non-empty src"):
+            inspect_html("<section><img></section>")
+
+    def test_gzh_image_rewrite_preserves_non_image_markup(self) -> None:
+        source = (
+            '<section><svg viewBox="0 0 10 10"></svg>'
+            '<span leaf=""><img src="image%20one.png" style="max-width:100%;"></span></section>'
+        )
+        rewritten = rewrite_image_sources(
+            source, {"image%20one.png": "https://mmbiz.qpic.cn/new?a=1&b=2"}
+        )
+        self.assertIn('<svg viewBox="0 0 10 10"></svg>', rewritten)
+        self.assertIn('style="max-width:100%;"', rewritten)
+        self.assertIn("https://mmbiz.qpic.cn/new?a=1&amp;b=2", rewritten)
+
+    def test_gzh_html_uploads_local_images_once_and_keeps_mmbiz(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = root / "body image.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\nbody")
+            html = (
+                '<section><span leaf=""><img src="body%20image.png"></span>'
+                '<span leaf=""><img src="body%20image.png"></span>'
+                '<span leaf=""><img src="https://mmbiz.qpic.cn/already"></span></section>'
+            )
+            uploaded: list[Path] = []
+
+            def uploader(path: Path) -> str:
+                uploaded.append(path)
+                return "https://mmbiz.qpic.cn/uploaded"
+
+            rewritten, count = upload_html_images(html, root, uploader)
+            self.assertEqual(count, 1)
+            self.assertEqual(uploaded, [image.resolve()])
+            self.assertEqual(rewritten.count("https://mmbiz.qpic.cn/uploaded"), 2)
+            self.assertIn("https://mmbiz.qpic.cn/already", rewritten)
+
+    def test_article_html_dry_run_does_not_use_markdown_renderer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            article = root / "article-body.html"
+            article.write_text(
+                '<section><p><span leaf="">正文。</span></p></section>', encoding="utf-8"
+            )
+            env_file = root / ".env"
+            env_file.write_text("WECHAT_ACCOUNTS=personal\n", encoding="utf-8")
+            args = Namespace(
+                markdown=None,
+                markdown_pos=None,
+                html=str(article),
+                layout_manifest=None,
+                theme=None,
+                color=None,
+                no_cite=False,
+                title="HTML title",
+                author="Author",
+                summary="Summary",
+                cover=None,
+                account="personal",
+                env_file=str(env_file),
+                dry_run=True,
+                yes=True,
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(mode_article, "_run_renderer") as renderer,
+                redirect_stdout(output),
+            ):
+                result = mode_article.run(args)
+            self.assertEqual(result, 0)
+            renderer.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["mode"], "article-html")
+            self.assertEqual(payload["title"], "HTML title")
+
+    def test_article_html_dry_run_consumes_valid_layout_manifest_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "article-run"
+            pipeline = run_dir / ".pipeline"
+            pipeline.mkdir(parents=True)
+            original = pipeline / "input.md"
+            original.write_text("# 标题\n\n正文。\n", encoding="utf-8")
+            markdown = run_dir / "article-source.md"
+            markdown.write_bytes(original.read_bytes())
+            article = run_dir / "article-body.html"
+            article.write_text(
+                '<section><p><span leaf="">正文。</span></p></section>', encoding="utf-8"
+            )
+            cover = run_dir / "cover.png"
+            cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
+            run = {
+                "protocol_version": "2026-07-12-001",
+                "run_id": "run",
+                "canonical_output_dir": str(run_dir),
+            }
+            (pipeline / "run.json").write_text(json.dumps(run), encoding="utf-8")
+            gzh = ROOT / "skills" / "gzh-design"
+            lock = json.loads(
+                (ROOT / "third_party" / "gzh-design.lock.json").read_text(encoding="utf-8")
+            )
+            sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            layout = {
+                "schema_version": 1,
+                "protocol_version": "2026-07-12-001",
+                "run_id": "run",
+                "mode": "news",
+                "canonical_output_dir": str(run_dir),
+                "source": {
+                    "markdown_path": str(markdown),
+                    "markdown_sha256": sha(markdown),
+                    "original_path": str(original),
+                    "original_sha256": sha(original),
+                },
+                "skill_contract": {
+                    "skill_name": "gzh-design",
+                    "skill_path": str(gzh / "SKILL.md"),
+                    "skill_sha256": sha(gzh / "SKILL.md"),
+                    "tree_sha256": lock["tree_sha256"],
+                    "files_read": [
+                        str(gzh / "SKILL.md"),
+                        str(gzh / "references" / "theme-index.md"),
+                        str(gzh / "references" / "theme-moyu-green.md"),
+                        str(gzh / "references" / "common-components.md"),
+                    ],
+                    "upstream_commit": lock["commit"],
+                },
+                "decision": {
+                    "theme": "摸鱼绿",
+                    "theme_source": "auto",
+                    "article_type": "观点/深度分析",
+                    "content_policy": "preserve-visible-text",
+                },
+                "metadata": {
+                    "title": "Manifest title",
+                    "author": "Manifest author",
+                    "summary": "Manifest summary",
+                    "cover_path": str(cover),
+                },
+                "output": {
+                    "html_path": str(article),
+                    "html_sha256": sha(article),
+                    "generated_at": "2026-07-12T00:00:00+08:00",
+                },
+            }
+            layout_path = pipeline / "layout.json"
+            layout_path.write_text(json.dumps(layout), encoding="utf-8")
+            env_file = run_dir / ".env"
+            env_file.write_text("WECHAT_ACCOUNTS=personal\n", encoding="utf-8")
+            args = Namespace(
+                markdown=None, markdown_pos=None, html=str(article),
+                layout_manifest=str(layout_path), theme=None, color=None, no_cite=False,
+                title=None, author=None, summary=None, cover=None, account="personal",
+                env_file=str(env_file), dry_run=True, yes=True,
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = mode_article.run(args)
+            self.assertEqual(result, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["title"], "Manifest title")
+            self.assertEqual(payload["cover"], str(cover))
+
+    def test_article_html_publish_rewrites_images_and_submits_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            body_image = root / "body.png"
+            body_image.write_bytes(b"\x89PNG\r\n\x1a\nbody")
+            cover = root / "cover.png"
+            cover.write_bytes(b"png")
+            article = root / "article-body.html"
+            article.write_text(
+                '<section><p><span leaf="">正文。</span></p>'
+                '<span leaf=""><img src="body.png" style="max-width:100%;"></span></section>',
+                encoding="utf-8",
+            )
+            args = Namespace(
+                markdown=None,
+                markdown_pos=None,
+                html=str(article),
+                layout_manifest=None,
+                theme=None,
+                color=None,
+                no_cite=False,
+                title="HTML title",
+                author="Author",
+                summary="Summary",
+                cover=str(cover),
+                account="personal",
+                env_file=None,
+                dry_run=False,
+                yes=True,
+            )
+            captured: list[dict] = []
+
+            def add_draft(_api, _proxy, _token, articles):
+                captured.extend(articles)
+                return "draft-media"
+
+            with (
+                mock.patch.object(mode_article, "_load_layout_manifest", return_value=({}, None)),
+                mock.patch.object(mode_article, "merged_env", return_value=({"WECHAT_ACCOUNTS": "personal"}, None)),
+                mock.patch.object(mode_article, "get_access_token", return_value="token"),
+                mock.patch.object(mode_article, "upload_body_image", return_value="https://mmbiz.qpic.cn/body"),
+                mock.patch.object(mode_article, "upload_image", return_value="cover-media"),
+                mock.patch.object(mode_article, "add_draft", side_effect=add_draft),
+            ):
+                result = mode_article.run(args)
+            self.assertEqual(result, 0)
+            self.assertEqual(len(captured), 1)
+            self.assertIn("https://mmbiz.qpic.cn/body", captured[0]["content"])
+            self.assertNotIn('src="body.png"', captured[0]["content"])
+            self.assertTrue(captured[0]["content"].startswith("<section>"))
+            self.assertEqual(captured[0]["thumb_media_id"], "cover-media")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -65,6 +66,46 @@ def image_backends() -> tuple[list[str], str | None]:
     return data.get("fallback_order", []), None
 
 
+def tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(
+        path for path in root.rglob("*")
+        if path.is_file()
+        and path.name != ".DS_Store"
+        and path.suffix != ".pyc"
+        and "__pycache__" not in path.parts
+    ):
+        relative = path.relative_to(root).as_posix().encode()
+        contents = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(contents).to_bytes(8, "big"))
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+def validate_gzh_snapshot() -> str | None:
+    skill_root = PLUGIN_ROOT / "skills" / "gzh-design"
+    lock_path = PLUGIN_ROOT / "third_party" / "gzh-design.lock.json"
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        return f"unable to read bundled gzh-design lock: {err}"
+    required = [
+        skill_root / "SKILL.md",
+        skill_root / "references" / "theme-index.md",
+        skill_root / "references" / "common-components.md",
+        skill_root / "scripts" / "validate_gzh_html.py",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        return "bundled gzh-design runtime is incomplete: " + ", ".join(missing)
+    actual = tree_sha256(skill_root)
+    if actual != lock.get("tree_sha256"):
+        return "bundled gzh-design runtime hash does not match its lock"
+    return None
+
+
 def doctor(args: argparse.Namespace) -> int:
     config_path = resolve_env_file(args.env_file)
     file_values = load_dotenv(config_path)
@@ -96,12 +137,9 @@ def doctor(args: argparse.Namespace) -> int:
         errors.append("no image backend is configured")
 
     if args.mode == "news":
-        if not shutil.which("node"):
-            errors.append("Node.js is required for news/article mode")
-        if not shutil.which("npm"):
-            errors.append("npm is required to install article renderer dependencies")
-    elif not shutil.which("node"):
-        warnings.append("Node.js is not installed; newspic works, news mode will not")
+        gzh_error = validate_gzh_snapshot()
+        if gzh_error:
+            errors.append(gzh_error)
 
     result = {
         "ok": not errors,

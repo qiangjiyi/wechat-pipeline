@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/isjiamu/gzh-design-skill",
+  "commit": "ba1f4175519b481cb3566616c9e5178705067904",
+  "license": "AGPL-3.0-or-later with additional permission from the author",
+  "runtime_paths": [
+    "SKILL.md",
+    "references",
+    "scripts",
+    "assets"
+  ],
+  "tree_sha256": "630b32ccc97e8173cf9b835e02dd0b3964b7d3798252528fc933924d4bc62743"
+}
