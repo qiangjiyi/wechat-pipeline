@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import struct
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,10 @@ ALLOWED_VERDICTS = {
     "empty_output",
     "invalid_output",
     "contract_error",
+}
+BACKEND_ALIASES = {
+    "imagegen": "openai-native",
+    "codex-image-gen": "codex-cli",
 }
 REQUIRED_TOP_LEVEL = {
     "schema_version",
@@ -88,6 +93,26 @@ def is_png(path: Path) -> bool:
         return False
     with path.open("rb") as handle:
         return handle.read(len(PNG_SIGNATURE)) == PNG_SIGNATURE
+
+
+def png_dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or not header.startswith(PNG_SIGNATURE) or header[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">II", header[16:24])
+
+
+def expected_ratio(value: str) -> float | None:
+    try:
+        width, height = value.split(":", 1)
+        ratio = float(width) / float(height)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return ratio if ratio > 0 else None
 
 
 def read_preferred_style(path: Path) -> str | None:
@@ -196,6 +221,7 @@ def validate_image(
     base_dir: Path,
     canonical_dir: Path,
     phase: str,
+    configured_backends: set[str],
     errors: list[str],
 ) -> None:
     label = f"images[{index}]"
@@ -241,6 +267,12 @@ def validate_image(
             errors.append(f"{attempt_label}.scope must be image; preflight attempts belong in preflight.json")
         if attempt.get("verdict") not in ALLOWED_VERDICTS:
             errors.append(f"{attempt_label} invalid verdict: {attempt.get('verdict')!r}")
+        backend = str(attempt.get("backend", ""))
+        canonical_backend = BACKEND_ALIASES.get(backend, backend)
+        if canonical_backend not in configured_backends:
+            errors.append(
+                f"{attempt_label}.backend was not configured by preflight: {backend!r}"
+            )
         if attempt.get("prompt_sha256") != image.get("prompt_sha256"):
             errors.append(f"{attempt_label}.prompt_sha256 does not match the image prompt")
         started = parse_time(attempt.get("started_at"), f"{attempt_label}.started_at", errors)
@@ -264,6 +296,19 @@ def validate_image(
         errors.append(f"output is not a valid non-empty PNG: {output_path}")
     elif sha256_file(output_path) != image.get("output_sha256"):
         errors.append(f"output hash mismatch: {output_path}")
+    else:
+        dimensions = png_dimensions(output_path)
+        ratio = expected_ratio(str(image.get("aspect", "")))
+        if dimensions is None:
+            errors.append(f"output PNG is missing a valid IHDR dimension header: {output_path}")
+        elif ratio is None:
+            errors.append(f"{label}.aspect must use a positive width:height ratio")
+        else:
+            actual = dimensions[0] / dimensions[1]
+            if abs(actual - ratio) / ratio > 0.03:
+                errors.append(
+                    f"{label} dimensions {dimensions[0]}x{dimensions[1]} do not match aspect {image.get('aspect')}"
+                )
 
 
 def validate(manifest_path: Path, phase: str) -> list[str]:
@@ -279,6 +324,20 @@ def validate(manifest_path: Path, phase: str) -> list[str]:
         errors.append(f"protocol_version must be {PROTOCOL_VERSION}")
 
     canonical_dir = Path(str(manifest.get("canonical_output_dir", ""))).expanduser().resolve()
+    configured_backends: set[str] = set()
+    preflight_path = canonical_dir / ".pipeline" / "preflight.json"
+    if not preflight_path.is_file():
+        errors.append(f"image backend preflight not found: {preflight_path}")
+    else:
+        try:
+            preflight = load_json(preflight_path)
+            configured_backends = {
+                str(value) for value in preflight.get("fallback_order", []) if value
+            }
+        except (OSError, ValueError) as err:
+            errors.append(f"unable to read image backend preflight: {err}")
+        if not configured_backends:
+            errors.append("preflight fallback_order must contain at least one configured backend")
     expected_manifest = canonical_dir / ".pipeline" / "manifest.json"
     if manifest_path != expected_manifest:
         errors.append(f"manifest must live at {expected_manifest}")
@@ -299,8 +358,33 @@ def validate(manifest_path: Path, phase: str) -> list[str]:
     if not isinstance(images, list) or not images:
         errors.append("manifest.images must be a non-empty list")
     else:
+        ids = [str(image.get("id", "")) for image in images if isinstance(image, dict)]
+        prompt_paths = [str(image.get("prompt_path", "")) for image in images if isinstance(image, dict)]
+        output_paths = [str(image.get("output_path", "")) for image in images if isinstance(image, dict)]
+        if len(ids) != len(set(ids)):
+            errors.append("manifest image IDs must be unique")
+        if len(prompt_paths) != len(set(prompt_paths)):
+            errors.append("manifest prompt paths must be unique")
+        if len(output_paths) != len(set(output_paths)):
+            errors.append("manifest output paths must be unique")
         for index, image in enumerate(images, start=1):
-            validate_image(image, index, base_dir, canonical_dir, phase, errors)
+            validate_image(
+                image,
+                index,
+                base_dir,
+                canonical_dir,
+                phase,
+                configured_backends,
+                errors,
+            )
+        if phase == "publish-ready":
+            output_hashes = [
+                str(image.get("output_sha256", ""))
+                for image in images
+                if isinstance(image, dict) and image.get("output_sha256")
+            ]
+            if len(output_hashes) != len(set(output_hashes)):
+                errors.append("manifest contains duplicate rendered image files")
     return errors
 
 

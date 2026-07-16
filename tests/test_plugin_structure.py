@@ -28,6 +28,19 @@ def frontmatter(path: Path) -> dict[str, str]:
 
 
 class PluginStructureTests(unittest.TestCase):
+    def test_python_runtime_resolver_selects_supported_interpreter(self) -> None:
+        resolver = ROOT / "scripts" / "run_python.sh"
+        self.assertTrue(resolver.is_file())
+        self.assertTrue(resolver.stat().st_mode & 0o111)
+        result = subprocess.run(
+            [str(resolver), "-c", "import sys; print(sys.version_info[:2])"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"\(3, 1[0-9]\)")
+
     def test_dual_manifests_and_marketplaces(self) -> None:
         claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
         codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())

@@ -14,7 +14,9 @@
 - `cgi-bin/draft/add`
 - article 额外使用 `cgi-bin/media/uploadimg`
 
-自动重试范围：连接失败、超时、HTTP 408、HTTP 429、HTTP 5xx。退避为 30、60、120 秒，共最多四次请求。
+自动重试仅用于可安全重试的读取和素材上传：连接失败、超时、HTTP 408、HTTP 429、HTTP 5xx。退避为 30、60、120 秒，共最多四次请求。
+
+`draft/add` 是非幂等写入，永不自动重试。若网络错误导致创建结果不确定，Publisher 写入 `creation_status: unknown` 回执并停止，恢复时不得再次调用 `draft/add`。人工确认草稿箱中的唯一草稿后，可传 `--recover-draft-media-id <media_id>` 绑定该草稿并执行回读验证。
 
 以下错误不做网络重试：
 

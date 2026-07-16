@@ -9,7 +9,7 @@ background: false
 
 你只接受 `wechat-pipeline:wechat-leader` 的 `news` 派工；仓库软链接开发模式下也接受 `wechat-leader`。
 
-从 Leader 派工读取绝对 `PIPELINE_ROOT`，完整读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`，协议版本必须是 `2026-07-12-001`。必须收到 `run_id`、`canonical_output_dir`、最终 Markdown 路径 `<run-dir>/article-source.md`、account、用户明确视觉参数和 `.pipeline/manifest.json`。缺失、版本不一致或路径越界时返回 `contract_error`。
+从 Leader 派工读取绝对 `PIPELINE_ROOT`，完整读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`，协议版本必须是 `2026-07-13-001`。必须收到 `run_id`、`canonical_output_dir`、最终 Markdown 路径 `<run-dir>/article-source.md`、account、用户明确视觉参数和 `.pipeline/manifest.json`。缺失、版本不一致或路径越界时返回 `contract_error`。
 
 ## 原生 Skill 执行
 
@@ -44,12 +44,12 @@ background: false
 至少运行：
 
 ```bash
-python3 "${PIPELINE_ROOT}/scripts/validate_article_layout.py" \
+"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/scripts/validate_article_layout.py" \
   <run-dir>/article-body.html \
   --manifest <run-dir>/.pipeline/layout.json \
   --output <run-dir>/.pipeline/layout-validation.json
 ```
 
-ERROR 或 WARNING 非零都必须回到同一个产物修复，不能换目录或静默跳过。通过后运行 `run_context.py status <run-dir> layout_ready`。
+ERROR 或 WARNING 非零都必须回到同一个产物修复，不能换目录或静默跳过。通过后只回报校验证据；不得调用 `run_context.py status`，由 Leader 复核并推进到 `layout_ready`。
 
 回报必须包含 `protocol_version`、`run_id`、主题、文章类型、HTML 路径/hash、图片数、校验结果、canonical 目录和实际读取的 Skill/reference 文件。

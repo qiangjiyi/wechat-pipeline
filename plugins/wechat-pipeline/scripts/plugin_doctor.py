@@ -17,6 +17,8 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from shared.dotenv import load_dotenv
+from shared.file_utils import is_relevant_file
+from run_context import default_exports_root
 
 
 DEFAULT_CONFIG = Path("~/.config/wechat-pipeline/.env").expanduser()
@@ -70,10 +72,7 @@ def tree_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(
         path for path in root.rglob("*")
-        if path.is_file()
-        and path.name != ".DS_Store"
-        and path.suffix != ".pyc"
-        and "__pycache__" not in path.parts
+        if path.is_file() and is_relevant_file(path)
     ):
         relative = path.relative_to(root).as_posix().encode()
         contents = path.read_bytes()
@@ -141,11 +140,29 @@ def doctor(args: argparse.Namespace) -> int:
         if gzh_error:
             errors.append(gzh_error)
 
+    # Check exports directory alignment with global workspace convention
+    exports_root = Path(
+        values.get("WECHAT_PIPELINE_EXPORTS_DIR", "~/Workspace/exports")
+    ).expanduser().resolve()
+    expected_exports_root = Path("~/Workspace/exports").expanduser().resolve()
+    if exports_root != expected_exports_root:
+        warnings.append(
+            f"exports_dir does not match global workspace convention; expected {expected_exports_root}, got {exports_root}; "
+            "set WECHAT_PIPELINE_EXPORTS_DIR=$HOME/Workspace/exports in ~/.config/wechat-pipeline/.env to align"
+        )
+
     result = {
         "ok": not errors,
         "plugin_root": str(PLUGIN_ROOT),
+        "python_executable": sys.executable,
+        "python_version": ".".join(str(part) for part in sys.version_info[:3]),
         "config_file": str(config_path),
         "config_file_exists": config_path.is_file(),
+        "exports_root": str(
+            Path(values.get("WECHAT_PIPELINE_EXPORTS_DIR", "~/Workspace/exports"))
+            .expanduser()
+            .resolve()
+        ),
         "requested_account": args.account,
         "configured_accounts": accounts,
         "image_backends": backends,

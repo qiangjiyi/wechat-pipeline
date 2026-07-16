@@ -274,6 +274,8 @@ Publisher 支持：
 - `article --html`：发布经过 layout manifest 验收的 gzh-design HTML，上传正文图和永久封面素材
 - `article <markdown>`：显式使用旧 Markdown renderer 的兼容路径
 - `--dry-run`：校验并展示最终计划，不发起微信写入
+- `--result-output <path> --verify-draft`：原子保存草稿回执并通过 `draft/get` 回读验收；完整流水线固定启用
+- newspic 完整流水线固定使用 `--manifest` 绑定 sealed 原文、图片顺序与 hash；素材上传结果按张持久化恢复
 
 ## 工作原理
 
@@ -290,7 +292,9 @@ flowchart LR
     V2 --> T["Typesetter 执行 gzh-design"]
     T --> LV["Layout HTML 校验"]
     LV --> P2["Publisher 上传图片并替换 src"]
-    P2 --> W["微信公众号草稿箱"]
+    P2 --> W["创建唯一草稿并原子写回执"]
+    W --> RV["draft/get 回读验收"]
+    RV --> DONE["published"]
 ```
 
 Claude Code 由 `wechat-leader` Agent 独占协调；Codex 由 `wechat-pipeline` Skill 作为逻辑 Leader 调度子 Agent。两者共享同一份运行协议和校验脚本。
@@ -303,26 +307,31 @@ news:    input_sealed -> planning -> rendering -> ready -> typesetting -> layout
 ```
 
 失败状态记录失败前阶段，恢复时回到同一个 `run_id`；`published` 和 `cancelled` 是终态。
+状态只由 Leader 推进，并自动追加到 `.pipeline/events.jsonl`。草稿已经创建但回读中断时，恢复流程只重试验证，不再调用 `draft/add`。
 
 ### 运行目录
 
-默认根目录：
+根目录可在进程环境或 `~/.config/wechat-pipeline/.env[.local]` 中配置：
 
 ```text
-${WECHAT_PIPELINE_EXPORTS_DIR:-$HOME/wechat-pipeline-exports}
+${WECHAT_PIPELINE_EXPORTS_DIR:-$HOME/Workspace/exports}
 ```
 
 典型结构：
 
 ```text
-wechat-pipeline-exports/
+exports/
 ├── image-cards/
 │   └── <slug>-<run_id>/
 │       ├── .pipeline/
 │       │   ├── input.md
 │       │   ├── run.json
+│       │   ├── events.jsonl
+│       │   ├── progress.json
 │       │   ├── doctor.json
-│       │   └── manifest.json
+│       │   ├── manifest.json
+│       │   ├── publish-result.json
+│       │   └── publish-result.lock
 │       ├── prompts/
 │       └── *.png
 └── wechat-articles/
@@ -449,7 +458,10 @@ python3 scripts/sync_gzh_design_skill.py \
 - Doctor 只检查配置是否存在，不打印密钥，也不在线验证 token。
 - 默认只创建草稿，不执行正式群发。
 - 命名账号凭据严格隔离，不回退到全局账号。
-- Publisher 仅对 408、429、5xx 和网络连接错误执行 30/60/120 秒退避；微信业务错误不会盲目重试。
+- Publisher 仅对可安全重试的读取和素材上传执行 30/60/120 秒退避；非幂等 `draft/add` 永不自动重试，结果不确定时阻止重复创建。
+- 所有运行脚本通过 `run_python.sh` 自动选择 Python 3.10+；也可在进程环境显式设置 `WECHAT_PIPELINE_PYTHON`。
+- `published` 必须同时具备持久化 `draft_media_id` 和成功的草稿回读验证。
+- 长耗时 worker 通过 `progress.json` 报告结构化进度；图片尺寸、比例和重复输出在 publish-ready 阶段阻断。
 - Agent 不得绕过 manifest 校验补文件、改 prompt、重命名图片或自行伪造 Skill 产物。
 
 ## 本地开发
@@ -476,6 +488,8 @@ python3 plugins/wechat-pipeline/skills/wechat-publisher/scripts/publish.py \
   article \
   --html /absolute/run/article-body.html \
   --layout-manifest /absolute/run/.pipeline/layout.json \
+  --result-output /absolute/run/.pipeline/publish-result.json \
+  --verify-draft \
   --account personal \
   --env-file plugins/wechat-pipeline/skills/wechat-publisher/.env.example \
   --dry-run

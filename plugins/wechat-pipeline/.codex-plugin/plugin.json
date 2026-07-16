@@ -1,6 +1,6 @@
 {
   "name": "wechat-pipeline",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "End-to-end WeChat Official Account draft pipeline with multi-agent formatting, pinned Baoyu image generation, gzh-design typesetting, validation, and publishing.",
   "author": {
     "name": "jiyi",

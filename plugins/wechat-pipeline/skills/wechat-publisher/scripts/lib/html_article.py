@@ -166,10 +166,13 @@ def upload_html_images(
     html: str,
     base_dir: Path,
     uploader: Callable[[Path], str],
+    *,
+    existing: dict[str, str] | None = None,
+    on_uploaded: Callable[[str, str], None] | None = None,
 ) -> tuple[str, int]:
     sources = inspect_html(html)
     replacements: dict[str, str] = {}
-    uploaded: dict[str, str] = {}
+    uploaded: dict[str, str] = dict(existing or {})
     with tempfile.TemporaryDirectory(prefix="wechat-publisher-html-") as temporary:
         temp_dir = Path(temporary)
         for index, source in enumerate(sources, start=1):
@@ -180,8 +183,10 @@ def upload_html_images(
                 continue
             parsed = urllib.parse.urlparse(source)
             image = _download_image(source, temp_dir) if parsed.scheme in {"http", "https"} else _local_image(source, base_dir)
-            print(f"[{index}/{len(sources)}] upload body image {image.name}")
+            print(f"[{index}/{len(sources)}] upload body image {image.name}", flush=True)
             mmbiz_url = uploader(image)
             uploaded[source] = mmbiz_url
             replacements[source] = mmbiz_url
+            if on_uploaded:
+                on_uploaded(source, mmbiz_url)
     return rewrite_image_sources(html, replacements), len(uploaded)

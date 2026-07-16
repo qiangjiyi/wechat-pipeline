@@ -17,6 +17,10 @@ from protocol_version import PROTOCOL_VERSION
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT))
+
+from shared.file_utils import is_relevant_file
+
 GZH_ROOT = PLUGIN_ROOT / "skills" / "gzh-design"
 UPSTREAM_VALIDATOR = GZH_ROOT / "scripts" / "validate_gzh_html.py"
 LOCK_PATH = PLUGIN_ROOT / "third_party" / "gzh-design.lock.json"
@@ -41,10 +45,7 @@ def tree_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(
         path for path in root.rglob("*")
-        if path.is_file()
-        and path.name != ".DS_Store"
-        and path.suffix != ".pyc"
-        and "__pycache__" not in path.parts
+        if path.is_file() and is_relevant_file(path)
     ):
         relative = path.relative_to(root).as_posix().encode()
         contents = path.read_bytes()

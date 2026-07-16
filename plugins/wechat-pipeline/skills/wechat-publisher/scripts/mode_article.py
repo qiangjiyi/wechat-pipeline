@@ -4,6 +4,7 @@ rewrite the HTML with mmbiz URLs, upload a cover, and POST a news draft."""
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -14,13 +15,24 @@ from pathlib import Path
 
 from lib.account import account_value, resolve_account
 from lib.env_loader import merged_env
-from lib.errors import PublishError
+from lib.errors import PublishError, RetryablePublishError
 from lib.html_article import inspect_html, upload_html_images
+from lib.draft_verifier import verify_article_draft
 from lib.proxy_client import (
     add_draft,
+    get_draft,
     get_access_token,
     upload_body_image,
     upload_image,
+)
+from lib.result_store import (
+    fingerprint,
+    load_matching_receipt,
+    publish_lock,
+    resolve_result_path,
+    run_identity,
+    sha256_file,
+    write_receipt,
 )
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -123,6 +135,12 @@ def _confirm_article(account: str, title: str, summary: str, image_count: int, c
 
 
 def run(args) -> int:
+    result_path = resolve_result_path(getattr(args, "result_output", None))
+    with publish_lock(None if getattr(args, "dry_run", False) else result_path):
+        return _run(args)
+
+
+def _run(args) -> int:
     html_arg = getattr(args, "html", None)
     if html_arg:
         if args.markdown or args.markdown_pos:
@@ -201,6 +219,24 @@ def _run_html(args, html_path: Path) -> int:
     api_base = env.get("WECHAT_API_BASE", "").strip() or "https://api.weixin.qq.com"
     proxy_url = env.get("WECHAT_PROXY_URL", "").strip()
     cover_path, cover_source = _resolve_html_cover(args, metadata, base_dir)
+    result_path = resolve_result_path(getattr(args, "result_output", None))
+    verify_draft = bool(getattr(args, "verify_draft", False))
+    if verify_draft and result_path is None:
+        raise PublishError("--verify-draft requires --result-output so a created draft cannot be duplicated")
+    identity = run_identity(result_path)
+    if manifest_path and result_path and result_path != manifest_path.parent / "publish-result.json":
+        raise PublishError("pipeline HTML publishing requires .pipeline/publish-result.json")
+    publish_fingerprint = fingerprint({
+        "mode": "article-html",
+        "account": account,
+        "title": title,
+        "author": author,
+        "summary": summary,
+        "html_sha256": hashlib.sha256(html.encode("utf-8")).hexdigest(),
+        "layout_sha256": sha256_file(manifest_path) if manifest_path else None,
+        "cover_sha256": sha256_file(cover_path) if cover_path else None,
+        "run_identity": identity,
+    })
 
     if args.dry_run:
         print(json.dumps({
@@ -218,6 +254,9 @@ def _run_html(args, html_path: Path) -> int:
             "cover": str(cover_path) if cover_path else None,
             "cover_source": cover_source,
             "html_bytes": len(html.encode("utf-8")),
+            "publish_fingerprint": publish_fingerprint,
+            "result_output": str(result_path) if result_path else None,
+            "verify_draft": verify_draft,
         }, ensure_ascii=False, indent=2))
         return 0
 
@@ -226,18 +265,116 @@ def _run_html(args, html_path: Path) -> int:
     if not args.yes:
         _confirm_article(account, title, summary, len(sources), cover_path)
 
+    existing = load_matching_receipt(result_path, publish_fingerprint)
+    checkpoint = None
+    if existing:
+        if existing.get("creation_status") == "unknown":
+            recovered = str(getattr(args, "recover_draft_media_id", None) or "").strip()
+            if not recovered:
+                raise PublishError(
+                    "draft creation outcome is unknown; refuse to call draft/add again. "
+                    "Inspect the WeChat draft list, then pass --recover-draft-media-id to verify "
+                    f"the confirmed draft: {result_path}"
+                )
+            existing["draft_media_id"] = recovered
+            existing["creation_status"] = "recovered"
+            existing["verification"] = {"ok": False, "status": "pending"}
+            existing = write_receipt(result_path, existing)
+        if not existing.get("draft_media_id"):
+            checkpoint = existing
+        elif verify_draft and not existing.get("verification", {}).get("ok"):
+            print("resume: draft already exists; retrying draft/get verification only", flush=True)
+            token = get_access_token(env, account, api_base, proxy_url)
+            verification = verify_article_draft(
+                get_draft(api_base, proxy_url, token, str(existing["draft_media_id"])),
+                title=title,
+                summary=summary,
+                source_html=html,
+                expected_image_count=len(sources),
+            )
+            existing["verification"] = verification
+            existing["ok"] = verification["ok"]
+            if verification["ok"]:
+                existing.pop("error", None)
+            existing = write_receipt(result_path, existing)
+            if not verification["ok"]:
+                raise PublishError(
+                    f"draft exists but read-back verification failed; receipt preserved at {result_path}: "
+                    + "; ".join(verification["errors"])
+                )
+        if existing.get("draft_media_id"):
+            print(json.dumps({**existing, "reused": True}, ensure_ascii=False))
+            return 0
+
+    print("[publish 1/4] resolve access token", flush=True)
     token = get_access_token(env, account, api_base, proxy_url)
+    print(f"[publish 2/4] upload and rewrite {len(sources)} body image(s)", flush=True)
+    binding_fields = {
+        "layout_sha256": sha256_file(manifest_path) if manifest_path else None,
+        "html_sha256": sha256_file(html_path),
+    }
+    uploaded_body_images = dict((checkpoint or {}).get("uploaded_body_images") or {})
+
+    def persist_body_checkpoint() -> None:
+        write_receipt(result_path, {
+            "ok": False,
+            "mode": "article-html",
+            "account": account,
+            "publish_fingerprint": publish_fingerprint,
+            "draft_media_id": None,
+            "creation_status": "uploading",
+            "title": title,
+            "summary": summary,
+            "body_image_count": len(sources),
+            "uploaded_body_images": uploaded_body_images,
+            "cover_path": str(cover_path),
+            "cover_source": cover_source,
+            **binding_fields,
+            "verification": {"ok": False, "status": "pending"},
+        })
+
+    def save_body_checkpoint(source: str, url: str) -> None:
+        uploaded_body_images[source] = url
+        persist_body_checkpoint()
+
+    if not checkpoint:
+        persist_body_checkpoint()
+    elif uploaded_body_images:
+        print(f"resume: reusing {len(uploaded_body_images)} uploaded body image(s)", flush=True)
     html, uploaded_count = upload_html_images(
         html,
         base_dir,
         lambda image: upload_body_image(proxy_url, api_base, token, image),
+        existing=uploaded_body_images,
+        on_uploaded=save_body_checkpoint,
     )
     # Re-run the same fragment checks after source rewriting. The upstream layout
     # validator ran before upload and the replacement changes only img[src].
     inspect_html(html)
 
-    print(f"upload cover ({cover_source}): {cover_path}")
-    thumb_media_id = upload_image(proxy_url, api_base, token, cover_path)
+    thumb_media_id = str((checkpoint or {}).get("thumb_media_id") or "")
+    if thumb_media_id:
+        print("[publish 3/4] reuse uploaded cover", flush=True)
+    else:
+        print(f"[publish 3/4] upload cover ({cover_source}): {cover_path}", flush=True)
+        thumb_media_id = upload_image(proxy_url, api_base, token, cover_path)
+        write_receipt(result_path, {
+            "ok": False,
+            "mode": "article-html",
+            "account": account,
+            "publish_fingerprint": publish_fingerprint,
+            "draft_media_id": None,
+            "creation_status": "ready_to_create",
+            "title": title,
+            "summary": summary,
+            "body_image_count": len(sources),
+            "uploaded_body_images": uploaded_body_images,
+            "cover_path": str(cover_path),
+            "cover_source": cover_source,
+            "thumb_media_id": thumb_media_id,
+            **binding_fields,
+            "verification": {"ok": False, "status": "pending"},
+        })
     article: dict = {
         "article_type": "news",
         "title": title,
@@ -250,17 +387,70 @@ def _run_html(args, html_path: Path) -> int:
         article["author"] = author
     if summary:
         article["digest"] = summary[:120]
-    draft_media_id = add_draft(api_base, proxy_url, token, [article])
-    print(json.dumps({
+    print("[publish 4/4] create one WeChat draft", flush=True)
+    try:
+        draft_media_id = add_draft(api_base, proxy_url, token, [article])
+    except RetryablePublishError as err:
+        write_receipt(result_path, {
+            "ok": False,
+            "mode": "article-html",
+            "account": account,
+            "publish_fingerprint": publish_fingerprint,
+            "draft_media_id": None,
+            "creation_status": "unknown",
+            "title": title,
+            "summary": summary,
+            "body_image_count": len(sources),
+            "uploaded_body_image_count": uploaded_count,
+            "cover_path": str(cover_path),
+            "cover_source": cover_source,
+            "thumb_media_id": thumb_media_id,
+            "uploaded_body_images": uploaded_body_images,
+            **binding_fields,
+            "verification": {"ok": False, "status": "blocked"},
+            "error": str(err),
+        })
+        raise PublishError(
+            "draft/add returned an ambiguous network failure; a safety receipt was preserved "
+            f"at {result_path} and automatic recreation is disabled"
+        ) from err
+    receipt = write_receipt(result_path, {
         "ok": True,
         "mode": "article-html",
         "account": account,
+        "publish_fingerprint": publish_fingerprint,
         "draft_media_id": draft_media_id,
+        "creation_status": "created",
+        **binding_fields,
         "title": title,
+        "summary": summary,
         "body_image_count": len(sources),
         "uploaded_body_image_count": uploaded_count,
+        "uploaded_body_images": uploaded_body_images,
+        "thumb_media_id": thumb_media_id,
+        "cover_path": str(cover_path),
         "cover_source": cover_source,
-    }, ensure_ascii=False))
+        "verification": {"ok": False, "status": "pending"} if verify_draft else {
+            "ok": False, "status": "skipped"
+        },
+    })
+    if verify_draft:
+        print("[verify] read back the created draft", flush=True)
+        verification = verify_article_draft(
+            get_draft(api_base, proxy_url, token, draft_media_id),
+            title=title,
+            summary=summary,
+            source_html=html,
+            expected_image_count=len(sources),
+        )
+        receipt["verification"] = verification
+        receipt = write_receipt(result_path, receipt)
+        if not verification["ok"]:
+            raise PublishError(
+                f"draft was created but read-back verification failed; receipt preserved at {result_path}: "
+                + "; ".join(verification["errors"])
+            )
+    print(json.dumps(receipt, ensure_ascii=False))
     return 0
 
 
@@ -286,6 +476,7 @@ def _run_rendered(args, markdown_path: Path, base_dir: Path, rendered: dict) -> 
     summary = (args.summary or rendered.get("summary") or "").strip()
     html = rendered.get("html") or ""
     content_images = rendered.get("contentImages") or []
+    verification_source_html = re.sub(r"WECHATIMGPH_\d+", "", html)
 
     if not title:
         raise PublishError("title is empty (provide --title or a markdown H1/frontmatter.title)")
@@ -319,6 +510,27 @@ def _run_rendered(args, markdown_path: Path, base_dir: Path, rendered: dict) -> 
                 cover_path = fb
                 cover_source = "imgs/cover.png"
 
+    result_path = resolve_result_path(getattr(args, "result_output", None))
+    verify_draft = bool(getattr(args, "verify_draft", False))
+    if verify_draft and result_path is None:
+        raise PublishError("--verify-draft requires --result-output so a created draft cannot be duplicated")
+    publish_fingerprint = fingerprint({
+        "mode": "article",
+        "account": account,
+        "title": title,
+        "author": author,
+        "summary": summary,
+        "html_sha256": hashlib.sha256(html.encode("utf-8")).hexdigest(),
+        "markdown_sha256": sha256_file(markdown_path),
+        "content_images": [
+            sha256_file(Path(item.get("localPath") or ""))
+            for item in content_images
+            if Path(item.get("localPath") or "").is_file()
+        ],
+        "cover_sha256": sha256_file(cover_path) if cover_path else None,
+        "run_identity": run_identity(result_path),
+    })
+
     # 4. Dry-run: print the resolved plan and return
     if args.dry_run:
         print(json.dumps({
@@ -338,6 +550,9 @@ def _run_rendered(args, markdown_path: Path, base_dir: Path, rendered: dict) -> 
             "cover": str(cover_path) if cover_path else None,
             "cover_source": cover_source,
             "html_bytes": len(html),
+            "publish_fingerprint": publish_fingerprint,
+            "result_output": str(result_path) if result_path else None,
+            "verify_draft": verify_draft,
         }, ensure_ascii=False, indent=2))
         return 0
 
@@ -345,7 +560,45 @@ def _run_rendered(args, markdown_path: Path, base_dir: Path, rendered: dict) -> 
     if not args.yes:
         _confirm_article(account, title, summary, len(content_images), cover_path)
 
+    existing = load_matching_receipt(result_path, publish_fingerprint)
+    if existing:
+        if existing.get("creation_status") == "unknown":
+            recovered = str(getattr(args, "recover_draft_media_id", None) or "").strip()
+            if not recovered:
+                raise PublishError(
+                    "draft creation outcome is unknown; refuse to call draft/add again. "
+                    "Inspect the WeChat draft list, then pass --recover-draft-media-id to verify "
+                    f"the confirmed draft: {result_path}"
+                )
+            existing["draft_media_id"] = recovered
+            existing["creation_status"] = "recovered"
+            existing["verification"] = {"ok": False, "status": "pending"}
+            existing = write_receipt(result_path, existing)
+        if verify_draft and not existing.get("verification", {}).get("ok"):
+            print("resume: draft already exists; retrying draft/get verification only", flush=True)
+            token = get_access_token(env, account, api_base, proxy_url)
+            verification = verify_article_draft(
+                get_draft(api_base, proxy_url, token, str(existing["draft_media_id"])),
+                title=title,
+                summary=summary,
+                source_html=verification_source_html,
+                expected_image_count=len(content_images),
+            )
+            existing["verification"] = verification
+            existing["ok"] = verification["ok"]
+            if verification["ok"]:
+                existing.pop("error", None)
+            existing = write_receipt(result_path, existing)
+            if not verification["ok"]:
+                raise PublishError(
+                    f"draft exists but read-back verification failed; receipt preserved at {result_path}: "
+                    + "; ".join(verification["errors"])
+                )
+        print(json.dumps({**existing, "reused": True}, ensure_ascii=False))
+        return 0
+
     # 6. Get access token
+    print("[publish 1/4] resolve access token", flush=True)
     token = get_access_token(env, account, api_base, proxy_url)
 
     # 7. Upload body images, collect mmbiz URLs, then rewrite HTML
@@ -354,7 +607,10 @@ def _run_rendered(args, markdown_path: Path, base_dir: Path, rendered: dict) -> 
         local_path = Path(img.get("localPath") or "")
         if not local_path or not local_path.exists():
             raise PublishError(f"body image not found: {img.get('originalPath')}")
-        print(f"[{idx}/{len(content_images)}] upload body image {local_path.name}")
+        print(
+            f"[publish 2/4][{idx}/{len(content_images)}] upload body image {local_path.name}",
+            flush=True,
+        )
         mmbiz_url = upload_body_image(proxy_url, api_base, token, local_path)
         replacements.append((img["placeholder"], mmbiz_url))
     html = _rewrite_html_with_mmbiz(html, replacements)
@@ -369,7 +625,7 @@ def _run_rendered(args, markdown_path: Path, base_dir: Path, rendered: dict) -> 
     if cover_path is None:
         raise PublishError("no cover image (provide --cover, frontmatter.coverImage, or imgs/cover.png)")
 
-    print(f"upload cover ({cover_source}): {cover_path}")
+    print(f"[publish 3/4] upload cover ({cover_source}): {cover_path}", flush=True)
     thumb_media_id = upload_image(proxy_url, api_base, token, cover_path)
 
     # 9. Compose article payload
@@ -388,14 +644,61 @@ def _run_rendered(args, markdown_path: Path, base_dir: Path, rendered: dict) -> 
         article["digest"] = summary[:120]
 
     # 10. Submit
-    draft_media_id = add_draft(api_base, proxy_url, token, [article])
-    print(json.dumps({
+    print("[publish 4/4] create one WeChat draft", flush=True)
+    try:
+        draft_media_id = add_draft(api_base, proxy_url, token, [article])
+    except RetryablePublishError as err:
+        write_receipt(result_path, {
+            "ok": False,
+            "mode": "article",
+            "account": account,
+            "publish_fingerprint": publish_fingerprint,
+            "draft_media_id": None,
+            "creation_status": "unknown",
+            "title": title,
+            "summary": summary,
+            "body_image_count": len(content_images),
+            "cover_path": str(cover_path),
+            "cover_source": cover_source,
+            "thumb_media_id": thumb_media_id,
+            "verification": {"ok": False, "status": "blocked"},
+            "error": str(err),
+        })
+        raise PublishError(
+            "draft/add returned an ambiguous network failure; a safety receipt was preserved "
+            f"at {result_path} and automatic recreation is disabled"
+        ) from err
+    receipt = write_receipt(result_path, {
         "ok": True,
         "mode": "article",
         "account": account,
+        "publish_fingerprint": publish_fingerprint,
         "draft_media_id": draft_media_id,
+        "creation_status": "created",
         "title": title,
+        "summary": summary,
         "body_image_count": len(content_images),
+        "cover_path": str(cover_path),
         "cover_source": cover_source,
-    }, ensure_ascii=False))
+        "verification": {"ok": False, "status": "pending"} if verify_draft else {
+            "ok": False, "status": "skipped"
+        },
+    })
+    if verify_draft:
+        print("[verify] read back the created draft", flush=True)
+        verification = verify_article_draft(
+            get_draft(api_base, proxy_url, token, draft_media_id),
+            title=title,
+            summary=summary,
+            source_html=verification_source_html,
+            expected_image_count=len(content_images),
+        )
+        receipt["verification"] = verification
+        receipt = write_receipt(result_path, receipt)
+        if not verification["ok"]:
+            raise PublishError(
+                f"draft was created but read-back verification failed; receipt preserved at {result_path}: "
+                + "; ".join(verification["errors"])
+            )
+    print(json.dumps(receipt, ensure_ascii=False))
     return 0

@@ -23,6 +23,7 @@ from lib import proxy_client  # noqa: E402
 from lib.account import account_value, resolve_account  # noqa: E402
 from lib.env_loader import load_dotenv, merged_env  # noqa: E402
 from lib.html_article import inspect_html, rewrite_image_sources, upload_html_images  # noqa: E402
+from lib.draft_verifier import verify_article_draft  # noqa: E402
 from lib.source_loader import load_source, parse_markdown, parse_simple_yaml, validate_newspic_source  # noqa: E402
 import mode_article  # noqa: E402
 import mode_newspic  # noqa: E402
@@ -172,8 +173,51 @@ class ProxyClientTests(unittest.TestCase):
         self.assertEqual(draft, "draft-1")
         self.assertEqual(proxy_json.call_args.args[2:], ("POST", {"articles": [{"title": "Title"}]}))
 
+        with mock.patch.object(
+            proxy_client, "proxy_json", return_value={"news_item": [{"title": "Title"}]}
+        ) as proxy_json:
+            fetched = proxy_client.get_draft(
+                "https://api.weixin.qq.com", "https://proxy.example", "token", "draft-1"
+            )
+        self.assertEqual(fetched["news_item"][0]["title"], "Title")
+        self.assertEqual(proxy_json.call_args.args[2:], ("POST", {"media_id": "draft-1"}))
+
+    def test_draft_add_never_retries_an_ambiguous_network_failure(self) -> None:
+        with (
+            mock.patch.object(
+                proxy_client.urllib.request,
+                "urlopen",
+                side_effect=urllib.error.URLError("response lost after commit"),
+            ) as urlopen,
+            mock.patch.object(proxy_client.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(PublishError, "network error"):
+                proxy_client.add_draft(
+                    "https://api.weixin.qq.com", "", "token", [{"title": "Title"}]
+                )
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
 
 class PublisherInputTests(unittest.TestCase):
+    def newspic_args(self, root: Path, images: list[Path]) -> Namespace:
+        return Namespace(
+            source=None,
+            manifest=None,
+            title="Title",
+            content="Body",
+            image=[str(path) for path in images],
+            author=None,
+            digest=None,
+            account="personal",
+            env_file=None,
+            dry_run=False,
+            yes=True,
+            result_output=str(root / ".pipeline" / "publish-result.json"),
+            verify_draft=True,
+            recover_draft_media_id=None,
+        )
+
     def test_named_account_never_falls_back_to_global_credentials(self) -> None:
         env = {
             "WECHAT_APP_ID": "global-id",
@@ -344,6 +388,25 @@ class PublisherInputTests(unittest.TestCase):
             self.assertEqual(rewritten.count("https://mmbiz.qpic.cn/uploaded"), 2)
             self.assertIn("https://mmbiz.qpic.cn/already", rewritten)
 
+    def test_draft_readback_verifies_text_title_and_wechat_images(self) -> None:
+        source = '<section><p><span leaf="">正文。</span></p><img src="local.png"></section>'
+        draft = {
+            "news_item": [{
+                "title": "Title",
+                "digest": "Summary",
+                "content": '<section><p><span leaf="">正文。</span></p>'
+                '<img src="https://mmbiz.qpic.cn/body"></section>',
+            }]
+        }
+        result = verify_article_draft(
+            draft,
+            title="Title",
+            summary="Summary",
+            source_html=source,
+            expected_image_count=1,
+        )
+        self.assertTrue(result["ok"], result)
+
     def test_article_html_dry_run_does_not_use_markdown_renderer(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -398,7 +461,7 @@ class PublisherInputTests(unittest.TestCase):
             cover = run_dir / "cover.png"
             cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
             run = {
-                "protocol_version": "2026-07-12-001",
+                "protocol_version": "2026-07-13-001",
                 "run_id": "run",
                 "canonical_output_dir": str(run_dir),
             }
@@ -410,7 +473,7 @@ class PublisherInputTests(unittest.TestCase):
             sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
             layout = {
                 "schema_version": 1,
-                "protocol_version": "2026-07-12-001",
+                "protocol_version": "2026-07-13-001",
                 "run_id": "run",
                 "mode": "news",
                 "canonical_output_dir": str(run_dir),
@@ -498,6 +561,8 @@ class PublisherInputTests(unittest.TestCase):
                 env_file=None,
                 dry_run=False,
                 yes=True,
+                result_output=str(root / ".pipeline" / "publish-result.json"),
+                verify_draft=True,
             )
             captured: list[dict] = []
 
@@ -512,14 +577,222 @@ class PublisherInputTests(unittest.TestCase):
                 mock.patch.object(mode_article, "upload_body_image", return_value="https://mmbiz.qpic.cn/body"),
                 mock.patch.object(mode_article, "upload_image", return_value="cover-media"),
                 mock.patch.object(mode_article, "add_draft", side_effect=add_draft),
+                mock.patch.object(
+                    mode_article,
+                    "get_draft",
+                    return_value={
+                        "news_item": [{
+                            "title": "HTML title",
+                            "digest": "Summary",
+                            "content": '<section><p><span leaf="">正文。</span></p>'
+                            '<span leaf=""><img src="https://mmbiz.qpic.cn/body" '
+                            'style="max-width:100%;"></span></section>',
+                        }]
+                    },
+                ) as get_draft,
             ):
                 result = mode_article.run(args)
+                resumed = mode_article.run(args)
             self.assertEqual(result, 0)
+            self.assertEqual(resumed, 0)
             self.assertEqual(len(captured), 1)
             self.assertIn("https://mmbiz.qpic.cn/body", captured[0]["content"])
             self.assertNotIn('src="body.png"', captured[0]["content"])
             self.assertTrue(captured[0]["content"].startswith("<section>"))
             self.assertEqual(captured[0]["thumb_media_id"], "cover-media")
+            self.assertEqual(get_draft.call_count, 1)
+            receipt = json.loads((root / ".pipeline" / "publish-result.json").read_text())
+            self.assertEqual(receipt["draft_media_id"], "draft-media")
+            self.assertTrue(receipt["verification"]["ok"])
+
+    def test_verification_resume_never_creates_a_second_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cover = root / "cover.png"
+            cover.write_bytes(b"png")
+            article = root / "article-body.html"
+            article.write_text(
+                '<section><p><span leaf="">正文。</span></p></section>', encoding="utf-8"
+            )
+            args = Namespace(
+                markdown=None, markdown_pos=None, html=str(article), layout_manifest=None,
+                theme=None, color=None, no_cite=False, title="HTML title", author="",
+                summary="Summary", cover=str(cover), account="personal", env_file=None,
+                dry_run=False, yes=True,
+                result_output=str(root / ".pipeline" / "publish-result.json"),
+                verify_draft=True,
+            )
+            bad = {"news_item": [{"title": "Wrong", "digest": "Summary", "content": ""}]}
+            good = {
+                "news_item": [{
+                    "title": "HTML title",
+                    "digest": "Summary",
+                    "content": '<section><p><span leaf="">正文。</span></p></section>',
+                }]
+            }
+            with (
+                mock.patch.object(mode_article, "_load_layout_manifest", return_value=({}, None)),
+                mock.patch.object(
+                    mode_article, "merged_env",
+                    return_value=({"WECHAT_ACCOUNTS": "personal"}, None),
+                ),
+                mock.patch.object(mode_article, "get_access_token", return_value="token"),
+                mock.patch.object(mode_article, "upload_image", return_value="cover-media"),
+                mock.patch.object(mode_article, "add_draft", return_value="draft-media") as add,
+                mock.patch.object(mode_article, "get_draft", side_effect=[bad, good]),
+            ):
+                with self.assertRaisesRegex(PublishError, "draft was created"):
+                    mode_article.run(args)
+                resumed = mode_article.run(args)
+            self.assertEqual(resumed, 0)
+            self.assertEqual(add.call_count, 1)
+            receipt = json.loads((root / ".pipeline" / "publish-result.json").read_text())
+            self.assertTrue(receipt["verification"]["ok"])
+
+    def test_newspic_ambiguous_draft_creation_is_never_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = root / "card.png"
+            image.write_bytes(b"png")
+            args = self.newspic_args(root, [image])
+            with (
+                mock.patch.object(mode_newspic, "merged_env", return_value=({}, None)),
+                mock.patch.object(mode_newspic, "get_access_token", return_value="token"),
+                mock.patch.object(mode_newspic, "upload_image", return_value="image-1"),
+                mock.patch.object(
+                    mode_newspic,
+                    "add_draft",
+                    side_effect=proxy_client.RetryablePublishError("response lost"),
+                ) as add,
+            ):
+                with self.assertRaisesRegex(PublishError, "ambiguous network failure"):
+                    mode_newspic.run(args)
+                with self.assertRaisesRegex(PublishError, "outcome is unknown"):
+                    mode_newspic.run(args)
+            self.assertEqual(add.call_count, 1)
+            receipt = json.loads((root / ".pipeline" / "publish-result.json").read_text())
+            self.assertEqual(receipt["creation_status"], "unknown")
+            args.recover_draft_media_id = "confirmed-draft"
+            with (
+                mock.patch.object(mode_newspic, "merged_env", return_value=({}, None)),
+                mock.patch.object(mode_newspic, "get_access_token", return_value="token"),
+                mock.patch.object(mode_newspic, "add_draft") as add_again,
+                mock.patch.object(
+                    mode_newspic,
+                    "get_draft",
+                    return_value={
+                        "news_item": [{
+                            "title": "Title",
+                            "content": "Body",
+                            "image_info": {"image_list": [
+                                {"image_media_id": "image-1"},
+                            ]},
+                        }]
+                    },
+                ),
+            ):
+                self.assertEqual(mode_newspic.run(args), 0)
+            add_again.assert_not_called()
+            recovered = json.loads((root / ".pipeline" / "publish-result.json").read_text())
+            self.assertEqual(recovered["creation_status"], "recovered")
+            self.assertTrue(recovered["verification"]["ok"])
+
+    def test_newspic_upload_checkpoint_resumes_without_reuploading_completed_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = [root / "one.png", root / "two.png"]
+            for image in images:
+                image.write_bytes(b"png")
+            args = self.newspic_args(root, images)
+            with (
+                mock.patch.object(mode_newspic, "merged_env", return_value=({}, None)),
+                mock.patch.object(mode_newspic, "get_access_token", return_value="token"),
+                mock.patch.object(
+                    mode_newspic,
+                    "upload_image",
+                    side_effect=["image-1", PublishError("upload stopped")],
+                ),
+            ):
+                with self.assertRaisesRegex(PublishError, "upload stopped"):
+                    mode_newspic.run(args)
+            with (
+                mock.patch.object(mode_newspic, "merged_env", return_value=({}, None)),
+                mock.patch.object(mode_newspic, "get_access_token", return_value="token"),
+                mock.patch.object(mode_newspic, "upload_image", return_value="image-2") as upload,
+                mock.patch.object(mode_newspic, "add_draft", return_value="draft-1"),
+                mock.patch.object(
+                    mode_newspic,
+                    "get_draft",
+                    return_value={
+                        "news_item": [{
+                            "title": "Title",
+                            "content": "Body",
+                            "image_info": {"image_list": [
+                                {"image_media_id": "image-1"},
+                                {"image_media_id": "image-2"},
+                            ]},
+                        }]
+                    },
+                ),
+            ):
+                self.assertEqual(mode_newspic.run(args), 0)
+            upload.assert_called_once()
+
+    def test_article_html_upload_checkpoint_resumes_body_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("one.png", "two.png"):
+                (root / name).write_bytes(b"\x89PNG\r\n\x1a\npayload")
+            cover = root / "cover.png"
+            cover.write_bytes(b"png")
+            article = root / "article-body.html"
+            article.write_text(
+                '<section><p><span leaf="">正文。</span></p>'
+                '<img src="one.png"><img src="two.png"></section>',
+                encoding="utf-8",
+            )
+            args = Namespace(
+                markdown=None, markdown_pos=None, html=str(article), layout_manifest=None,
+                theme=None, color=None, no_cite=False, title="Title", author="",
+                summary="", cover=str(cover), account="personal", env_file=None,
+                dry_run=False, yes=True,
+                result_output=str(root / ".pipeline" / "publish-result.json"),
+                verify_draft=True, recover_draft_media_id=None,
+            )
+            with (
+                mock.patch.object(mode_article, "_load_layout_manifest", return_value=({}, None)),
+                mock.patch.object(mode_article, "merged_env", return_value=({}, None)),
+                mock.patch.object(mode_article, "get_access_token", return_value="token"),
+                mock.patch.object(
+                    mode_article,
+                    "upload_body_image",
+                    side_effect=["https://mmbiz.qpic.cn/one", PublishError("upload stopped")],
+                ),
+            ):
+                with self.assertRaisesRegex(PublishError, "upload stopped"):
+                    mode_article.run(args)
+            final_html = (
+                '<section><p><span leaf="">正文。</span></p>'
+                '<img src="https://mmbiz.qpic.cn/one">'
+                '<img src="https://mmbiz.qpic.cn/two"></section>'
+            )
+            with (
+                mock.patch.object(mode_article, "_load_layout_manifest", return_value=({}, None)),
+                mock.patch.object(mode_article, "merged_env", return_value=({}, None)),
+                mock.patch.object(mode_article, "get_access_token", return_value="token"),
+                mock.patch.object(
+                    mode_article, "upload_body_image", return_value="https://mmbiz.qpic.cn/two"
+                ) as upload,
+                mock.patch.object(mode_article, "upload_image", return_value="cover-media"),
+                mock.patch.object(mode_article, "add_draft", return_value="draft-1"),
+                mock.patch.object(
+                    mode_article,
+                    "get_draft",
+                    return_value={"news_item": [{"title": "Title", "content": final_html}]},
+                ),
+            ):
+                self.assertEqual(mode_article.run(args), 0)
+            upload.assert_called_once()
 
 
 if __name__ == "__main__":

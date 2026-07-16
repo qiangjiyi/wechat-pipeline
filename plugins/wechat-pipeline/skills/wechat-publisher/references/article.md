@@ -3,9 +3,11 @@
 流水线默认提供经过 gzh-design 和 layout manifest 验收的 HTML 正文片段。Publisher 上传其中的正文图片，只替换 `img[src]` 为微信返回的 mmbiz URL，保留其他结构和内联样式。
 
 ```bash
-python3 "${PIPELINE_ROOT}/skills/wechat-publisher/scripts/publish.py" \
+"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/skills/wechat-publisher/scripts/publish.py" \
   article --html /absolute/run/article-body.html \
   --layout-manifest /absolute/run/.pipeline/layout.json \
+  --result-output /absolute/run/.pipeline/publish-result.json \
+  --verify-draft \
   --account personal --yes
 ```
 
@@ -39,6 +41,6 @@ Markdown 路径的元数据优先级：
 普通外链默认转为底部引用；`--no-cite` 保留内联链接。
 
 ```bash
-python3 "${PIPELINE_ROOT}/skills/wechat-publisher/scripts/publish.py" \
+"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/skills/wechat-publisher/scripts/publish.py" \
   article /absolute/path/article.md --theme grace --color blue --account personal --yes
 ```

@@ -6,6 +6,7 @@ import base64
 import json
 import mimetypes
 import secrets
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -30,10 +31,16 @@ def _with_network_retry(
     for attempt in range(len(backoff) + 1):
         try:
             return operation()
-        except RetryablePublishError:
+        except RetryablePublishError as err:
             if attempt == len(backoff):
                 raise
-            sleep(backoff[attempt])
+            delay = backoff[attempt]
+            print(
+                f"network retry {attempt + 1}/{len(backoff)} in {delay:g}s: {err}",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep(delay)
     raise AssertionError("retry loop exhausted unexpectedly")
 
 
@@ -79,12 +86,19 @@ def request_json(
     return _with_network_retry(operation, backoff=backoff, sleeper=sleeper)
 
 
-def proxy_json(proxy_url: str, url: str, method: str, payload: dict | None = None) -> dict:
+def proxy_json(
+    proxy_url: str,
+    url: str,
+    method: str,
+    payload: dict | None = None,
+    *,
+    backoff: tuple[float, ...] = NETWORK_BACKOFF_SECONDS,
+) -> dict:
     """Call the WeChat API through the HTTP proxy envelope: POST {url, method, data}."""
     envelope = {"url": url, "method": method}
     if payload is not None:
         envelope["data"] = payload
-    return request_json(proxy_url, "POST", envelope)
+    return request_json(proxy_url, "POST", envelope, backoff=backoff)
 
 
 def get_access_token(env: dict[str, str], account: str, api_base: str, proxy_url: str) -> str:
@@ -231,10 +245,24 @@ def upload_body_image(proxy_url: str, api_base: str, token: str, image: Path) ->
 
 
 def add_draft(api_base: str, proxy_url: str, token: str, articles: list[dict]) -> str:
-    """POST /cgi-bin/draft/add with the given articles list. Returns the new draft's media_id."""
+    """Create one draft without retrying an ambiguous, non-idempotent POST."""
     url = with_token(f"{api_base}/cgi-bin/draft/add", token)
-    data = proxy_json(proxy_url, url, "POST", {"articles": articles}) if proxy_url else request_json(url, "POST", {"articles": articles})
+    payload = {"articles": articles}
+    data = (
+        proxy_json(proxy_url, url, "POST", payload, backoff=())
+        if proxy_url
+        else request_json(url, "POST", payload, backoff=())
+    )
     media_id = data.get("media_id")
     if not media_id:
         raise PublishError(f"draft media_id missing: {data}")
     return str(media_id)
+
+
+def get_draft(api_base: str, proxy_url: str, token: str, media_id: str) -> dict:
+    """Read back one created draft for post-publish verification."""
+    url = with_token(f"{api_base}/cgi-bin/draft/get", token)
+    payload = {"media_id": media_id}
+    return proxy_json(proxy_url, url, "POST", payload) if proxy_url else request_json(
+        url, "POST", payload
+    )

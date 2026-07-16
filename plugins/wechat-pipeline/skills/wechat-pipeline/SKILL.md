@@ -12,7 +12,7 @@ This Skill is the cross-host front door. It owns routing only; it must never imi
 1. Check whether `CLAUDE_PLUGIN_ROOT` is present.
 2. On Claude Code, pass the user's request verbatim to the `wechat-pipeline:wechat-leader` Agent and stop. Do not call any Baoyu or publisher Skill from this outer context.
 3. On Codex, derive `PIPELINE_ROOT` from this Skill's absolute registry path: this file is `<PIPELINE_ROOT>/skills/wechat-pipeline/SKILL.md`.
-4. Read `<PIPELINE_ROOT>/docs/wechat-pipeline-protocol.md` completely and require `protocol_version: 2026-07-12-001`.
+4. Read `<PIPELINE_ROOT>/docs/wechat-pipeline-protocol.md` completely and require `protocol_version: 2026-07-13-001`.
 
 ## Codex Ownership
 
@@ -30,7 +30,7 @@ The user's invocation of this Skill explicitly authorizes the required Codex sub
 3. For local file input, pass its absolute path to `run_context.py init --source`.
 4. For chat input, preserve it byte-for-byte in a permission-`0600` temporary file, pass that file to `init --source`, and use `try/finally` to delete the temporary file whether initialization succeeds, fails, or is interrupted. Do not create an unhashed run and fill its input afterward.
 5. Run `<PIPELINE_ROOT>/scripts/plugin_doctor.py` for the selected mode and account. Stop before dispatch if it fails.
-6. Set the run status to `planning` before the first worker. Follow the protocol's state transitions; set `failed` before reporting a worker failure.
+6. Set the run status to `planning` with `--actor wechat-leader` before the first worker. The Leader is the only status writer; workers only return artifacts and evidence.
 
 ## Dispatch Workers
 
@@ -53,7 +53,7 @@ If structured Skill inputs are unavailable, include both the exact namespaced Sk
 
 The worker must execute the attached Skill's current `SKILL.md`, references, and selected `EXTEND.md` natively. It must not reconstruct the workflow from this coordinator summary.
 
-After designer planning, run manifest validation with `--phase plan`, then `--phase publish-ready` before typesetting. After typesetting, run `validate_article_layout.py` with the layout manifest. A failed check goes back to the same worker; the Leader must not repair artifacts. Publisher dispatch requires both gates.
+After designer planning, run manifest validation with `--phase plan`, record a `validation.passed`/`validation.failed` event, set `rendering`, and resume the same Designer for generation. Do the same for `publish-ready`, layout, and publish-result gates, including the gate name and artifact path in event details. After typesetting, run `validate_article_layout.py` with the layout manifest and set `layout_ready`. A failed check goes back to the same worker; the Leader must not repair artifacts. Before Publisher dispatch set `publishing`; newspic must publish through `--manifest <run-dir>/.pipeline/manifest.json`. Require `.pipeline/publish-result.json` plus explicit `draft/get` verification, run `validate_publish_result.py <run-dir>`, and set `published` only after that gate passes. A `creation_status: unknown` receipt is a safety stop and must never trigger another `draft/add`.
 
 ## Finish
 

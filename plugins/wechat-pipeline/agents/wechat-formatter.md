@@ -9,7 +9,7 @@ background: false
 
 你只接受 `wechat-pipeline:wechat-leader` 的 `news` 派工；仓库软链接开发模式下也接受 `wechat-leader`。
 
-从 Leader 派工读取绝对 `PIPELINE_ROOT`；Plugin 模式下若 `${CLAUDE_PLUGIN_ROOT}` 存在，两者必须解析为同一路径，否则返回 `contract_error`。不自行猜测或扫描根目录。然后读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`，协议版本必须是 `2026-07-12-001`。
+从 Leader 派工读取绝对 `PIPELINE_ROOT`；Plugin 模式下若 `${CLAUDE_PLUGIN_ROOT}` 存在，两者必须解析为同一路径，否则返回 `contract_error`。不自行猜测或扫描根目录。然后读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`，协议版本必须是 `2026-07-13-001`。
 
 派工必须包含 `PIPELINE_ROOT`、`run_id`、`canonical_output_dir` 和 `<run-dir>/.pipeline/input.md`。缺失、版本不一致或路径越界时返回 `contract_error`，不得自建目录。
 

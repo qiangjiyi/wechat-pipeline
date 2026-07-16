@@ -2,10 +2,22 @@
 
 ## Unreleased
 
+- 协议升级到 `2026-07-13-001`：状态只由 Leader 写入，并新增只追加的运行事件日志。
+- 新增 Python 3.10+ 自动解析启动器，避免系统 `python3` 版本过旧阻断可用运行时。
+- Publisher 新增原子 `publish-result.json`、请求指纹、防重复恢复和 `draft/get` 回读验收。
+- `published` 状态现在强制要求账号/模式匹配、`draft_media_id` 和成功的回读验证。
+- Designer attempt backend 必须与 preflight 已配置 provider 一致，并规范化宿主 imagegen 命名。
+- Publisher 输出分阶段上传、创建、验证进度，网络退避会显示重试次数和等待时间。
+- 非幂等 `draft/add` 禁止自动重试；不确定结果持久化为安全阻塞回执，素材上传支持检查点恢复。
+- Newspic Publisher 通过 manifest 强绑定 sealed 原文、图片顺序与 hash；回读验证禁止 `skipped` 冒充成功。
+- 状态机按 newspic/news 分离，禁止跳过 rendering 或 news typesetting/layout；图片门禁增加尺寸、比例与重复产物检查。
 - 原样纳入固定版本的 `gzh-design-skill`，新增独立公众号 HTML 排版阶段和校验门禁。
 - Publisher 新增已排版 HTML 输入通道，保留现有正文图上传、封面素材和草稿 API 能力。
 - 流水线协议升级，增加 typesetter、layout manifest 与可恢复的排版状态。
 - 增加从本地已更新 Baoyu 仓库完整同步五个固定 Skill 快照的维护脚本。
+- 默认输出目录对齐宿主全局工作区约定：`~/Workspace/exports`（原 `~/wechat-pipeline-exports`）。
+- `plugin_doctor.py` 增加 exports 目录约定检查，未对齐时给出显式警告和修复指引。
+- 新增 `shared.file_utils.is_relevant_file`，统一过滤 `.DS_Store`、`.pyc` 和 `__pycache__`，消除多脚本重复逻辑。
 
 ### Protocol 2026-07-11-002
 

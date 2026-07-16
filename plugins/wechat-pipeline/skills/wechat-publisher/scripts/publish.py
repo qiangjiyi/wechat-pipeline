@@ -24,12 +24,16 @@ def _newspic_parser(parent: argparse.ArgumentParser) -> None:
     parent.add_argument("--title", help="Override/provide the draft title.")
     parent.add_argument("--content", help="Override/provide the draft content.")
     parent.add_argument("--image", action="append", metavar="PATH", help="Image path; repeat for multiple images. Replaces images from the source.")
+    parent.add_argument("--manifest", help="Validated pipeline .pipeline/manifest.json; binds sealed text and ordered images.")
     parent.add_argument("--author", help="Override/provide the author.")
     parent.add_argument("--digest", help="Override/provide the digest.")
     parent.add_argument("--account", help="Account alias from WECHAT_ACCOUNTS.")
     parent.add_argument("--env-file", help="Path to .env/.env.local.")
     parent.add_argument("--dry-run", action="store_true", help="Validate and print the draft payload without uploading.")
     parent.add_argument("--yes", action="store_true", help="Skip interactive confirmation.")
+    parent.add_argument("--result-output", help="Atomically persist the draft receipt for duplicate-safe resume.")
+    parent.add_argument("--verify-draft", action="store_true", help="Read back and verify the created draft. Requires --result-output.")
+    parent.add_argument("--recover-draft-media-id", help="Bind a manually confirmed draft media_id after an ambiguous draft/add result, then verify it.")
 
 
 def _article_parser(parent: argparse.ArgumentParser) -> None:
@@ -48,6 +52,9 @@ def _article_parser(parent: argparse.ArgumentParser) -> None:
     parent.add_argument("--env-file", help="Path to .env/.env.local.")
     parent.add_argument("--dry-run", action="store_true", help="Validate and print the plan without uploading.")
     parent.add_argument("--yes", action="store_true", help="Skip interactive confirmation.")
+    parent.add_argument("--result-output", help="Atomically persist the draft receipt for duplicate-safe resume.")
+    parent.add_argument("--verify-draft", action="store_true", help="Read back and verify the created draft. Requires --result-output.")
+    parent.add_argument("--recover-draft-media-id", help="Bind a manually confirmed draft media_id after an ambiguous draft/add result, then verify it.")
 
 
 def main() -> int:

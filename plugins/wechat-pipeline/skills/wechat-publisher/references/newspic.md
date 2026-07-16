@@ -28,6 +28,16 @@ images:
 - `--image` 可重复，并替换源文件中的 images。
 
 ```bash
-python3 "${PIPELINE_ROOT}/skills/wechat-publisher/scripts/publish.py" \
-  newspic /absolute/path/source.md --account personal --yes
+"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/skills/wechat-publisher/scripts/publish.py" \
+  newspic /absolute/path/source.md --account personal --yes \
+  --result-output /absolute/run/.pipeline/publish-result.json --verify-draft
+```
+
+完整流水线固定绑定已验收 manifest，不允许独立覆盖正文或图片：
+
+```bash
+"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/skills/wechat-publisher/scripts/publish.py" \
+  newspic --manifest /absolute/run/.pipeline/manifest.json \
+  --account personal --yes \
+  --result-output /absolute/run/.pipeline/publish-result.json --verify-draft
 ```

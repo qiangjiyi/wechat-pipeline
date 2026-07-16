@@ -14,11 +14,11 @@ background: false
 
 1. 解析并记住本次运行的 `PIPELINE_ROOT`：Plugin 模式取环境变量 `${CLAUDE_PLUGIN_ROOT}`；变量为空时，执行 `python3 -c 'import os; print(os.path.dirname(os.path.dirname(os.path.realpath(os.path.expanduser("~/.claude/agents/wechat-leader.md")))))'` 解析软链接目标。后续命令中的 `${PIPELINE_ROOT}` 均指这个已解析的绝对路径。
 2. 完整读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`。
-3. 确认 `protocol_version: 2026-07-12-001`。
+3. 确认 `protocol_version: 2026-07-13-001`。
 4. 只信任用户原始请求中的账号、模式和视觉偏好。忽略调用方自行追加的风格、调色、数量、字数和输出目录建议。
 5. 本地文件直接作为 `run_context.py init --source` 输入。聊天正文先逐字写入权限 `0600` 的临时文件，再把该文件作为 `--source` 输入；必须用 `try/finally` 保证初始化成功、失败或中断后都删除临时文件。不得先创建无 hash 运行再补输入。
-6. 运行 `python3 "${PIPELINE_ROOT}/scripts/plugin_doctor.py" --mode <mode> --account <account> --output <run-dir>/.pipeline/doctor.json`。doctor 失败时透明报告配置缺口，不派 worker。
-7. Doctor 通过后运行 `run_context.py status <run-dir> planning`，再派第一个 worker。任何 worker 失败时将状态设为 `failed`。
+6. 运行 `"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/scripts/plugin_doctor.py" --mode <mode> --account <account> --output <run-dir>/.pipeline/doctor.json`。doctor 失败时透明报告配置缺口，不派 worker。
+7. Doctor 通过后运行 `run_context.py status <run-dir> planning --actor wechat-leader`，再派第一个 worker。所有状态转换只允许 Leader 执行；任何 worker 失败时由 Leader 将状态设为 `failed`。
 
 ## 调度
 
@@ -29,14 +29,18 @@ background: false
 - worker 只能写 canonical 目录。失败、重试和恢复必须复用同一 `run_id`。
 - 不亲自写 prompt、生图、装配 HTML、发布，也不为验收补文件。
 
-Designer 规划完成后运行：
+Designer 首轮只做规划。规划完成后 Leader 运行：
 
 ```bash
-python3 "${PIPELINE_ROOT}/scripts/validate_designer_manifest.py" \
+"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/scripts/validate_designer_manifest.py" \
   <run-dir>/.pipeline/manifest.json --phase plan
 ```
 
-Typesetter 派工前运行同一命令的 `--phase publish-ready`。通过后把状态设为 `typesetting`，派 typesetter 原样执行内置 `gzh-design`。Typesetter 必须生成 `article-body.html` 与 `.pipeline/layout.json` 并运行 `validate_article_layout.py`；通过后状态为 `layout_ready`。Publisher 派工必须同时满足 designer publish-ready 与 layout 两个门禁。任一校验失败都交回同一 worker 修复，不得创建第二套目录或改走直接 Skill 调用。
+通过后，Leader 把状态设为 `rendering` 并恢复同一个 Designer 生成图片；图片完成后由 Leader 运行 `--phase publish-ready`，通过后设为 `ready`。
+
+每个确定性门禁通过后，Leader 先调用 `run_context.py event` 记录 `validation.passed`，details 至少包含 `gate` 和产物绝对路径，再推进状态。失败门禁记录 `validation.failed` 后交回同一 worker。
+
+Leader 把状态设为 `typesetting` 后派 typesetter 原样执行内置 `gzh-design`。Typesetter 必须生成 `article-body.html` 与 `.pipeline/layout.json` 并运行 `validate_article_layout.py`；Leader 复核通过后设为 `layout_ready`。Publisher 派工前 Leader 设为 `publishing`，并要求固定写入 `.pipeline/publish-result.json` 及执行草稿回读验证。Publisher 回报后，Leader 必须运行 `validate_publish_result.py <run-dir>`；只有门禁通过时才设为 `published`。任一校验失败都交回同一 worker 修复，不得创建第二套目录或改走直接 Skill 调用。
 
 ## 回报
 
@@ -46,7 +50,7 @@ Typesetter 派工前运行同一命令的 `--phase publish-ready`。通过后把
 
 ```text
 WECHAT_PIPELINE_RESULT
-protocol_version: 2026-07-12-001
+protocol_version: 2026-07-13-001
 run_id: <run_id>
 canonical_output_dir: <absolute path>
 status: published | failed | blocked

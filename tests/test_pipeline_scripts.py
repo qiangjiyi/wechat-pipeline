@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -13,7 +15,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "plugins" / "wechat-pipeline"
 PYTHON = sys.executable
-PNG = b"\x89PNG\r\n\x1a\n" + b"test-png-payload"
+PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + b"\x00\x00\x00\rIHDR"
+    + struct.pack(">II", 300, 400)
+    + b"\x08\x06\x00\x00\x00"
+    + b"test-png-payload"
+)
 
 
 def sha256(path: Path) -> str:
@@ -52,6 +60,35 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertTrue(second_data["reused"])
             self.assertEqual(first_data["run_dir"], second_data["run_dir"])
 
+    def test_run_context_reads_exports_root_from_pipeline_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            config = home / ".config" / "wechat-pipeline" / ".env"
+            config.parent.mkdir(parents=True)
+            exports = root / "configured-exports"
+            config.write_text(f"WECHAT_PIPELINE_EXPORTS_DIR={exports}\n", encoding="utf-8")
+            source = root / "source.md"
+            source.write_text("configured root\n", encoding="utf-8")
+            env = dict(os.environ)
+            env.pop("WECHAT_PIPELINE_EXPORTS_DIR", None)
+            env["WECHAT_PUBLISHER_ENV_FILE"] = str(config)
+            result = subprocess.run(
+                [
+                    PYTHON, str(ROOT / "scripts" / "run_context.py"), "init",
+                    "--mode", "newspic", "--account", "xiyue", "--slug", "configured",
+                    "--source", str(source),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(
+                Path(json.loads(result.stdout)["run_dir"]).is_relative_to(exports.resolve())
+            )
+
     def test_concurrent_init_creates_only_one_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -72,6 +109,29 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertEqual({payload["run_dir"] for payload in payloads}, {payloads[0]["run_dir"]})
             self.assertEqual(sorted(payload["reused"] for payload in payloads), [False, True])
 
+    def test_run_files_are_private_and_progress_is_structured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("private\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init", "--mode", "newspic", "--account", "xiyue",
+                "--slug", "private", "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            run_dir = Path(json.loads(created.stdout)["run_dir"])
+            self.assertEqual(run_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((run_dir / ".pipeline").stat().st_mode & 0o777, 0o700)
+            self.assertEqual((run_dir / ".pipeline" / "input.md").stat().st_mode & 0o777, 0o400)
+            progress = self.run_script(
+                "run_context.py", "progress", str(run_dir),
+                "--actor", "wechat-designer", "--stage", "rendering",
+                "--completed", "1", "--total", "3", "--message", "first image",
+            )
+            self.assertEqual(progress.returncode, 0, progress.stderr)
+            payload = json.loads((run_dir / ".pipeline" / "progress.json").read_text())
+            self.assertEqual((payload["completed"], payload["total"]), (1, 3))
+
     def test_run_status_rejects_invalid_transition(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -86,17 +146,29 @@ class PipelineScriptTests(unittest.TestCase):
                 "--exports-root", str(root / "exports"),
             )
             run_dir = json.loads(created.stdout)["run_dir"]
-            invalid = self.run_script("run_context.py", "status", run_dir, "published")
+            worker_write = self.run_script(
+                "run_context.py", "status", run_dir, "planning", "--actor", "wechat-designer"
+            )
+            self.assertNotEqual(worker_write.returncode, 0)
+            self.assertIn("only be changed by actor wechat-leader", worker_write.stderr)
+            invalid = self.run_script("run_context.py", "status", run_dir, "published", "--actor", "wechat-leader")
             self.assertNotEqual(invalid.returncode, 0)
             self.assertIn("invalid run status transition", invalid.stderr)
-            valid = self.run_script("run_context.py", "status", run_dir, "planning")
+            valid = self.run_script("run_context.py", "status", run_dir, "planning", "--actor", "wechat-leader")
             self.assertEqual(valid.returncode, 0, valid.stderr)
-            failed = self.run_script("run_context.py", "status", run_dir, "failed")
+            failed = self.run_script("run_context.py", "status", run_dir, "failed", "--actor", "wechat-leader")
             self.assertEqual(failed.returncode, 0, failed.stderr)
-            wrong_resume = self.run_script("run_context.py", "status", run_dir, "ready")
+            wrong_resume = self.run_script("run_context.py", "status", run_dir, "ready", "--actor", "wechat-leader")
             self.assertNotEqual(wrong_resume.returncode, 0)
-            resumed = self.run_script("run_context.py", "status", run_dir, "planning")
+            resumed = self.run_script("run_context.py", "status", run_dir, "planning", "--actor", "wechat-leader")
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            events = [
+                json.loads(line)
+                for line in (Path(run_dir) / ".pipeline" / "events.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(events[0]["event"], "run.created")
+            self.assertEqual(events[-1]["details"], {"from": "failed", "to": "planning"})
+            self.assertTrue(all(event["actor"] == "wechat-leader" for event in events))
 
     def test_news_layout_status_sequence_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -112,9 +184,150 @@ class PipelineScriptTests(unittest.TestCase):
                 "--exports-root", str(root / "exports"),
             )
             run_dir = json.loads(created.stdout)["run_dir"]
-            for status in ("planning", "ready", "typesetting", "layout_ready", "publishing", "published"):
-                result = self.run_script("run_context.py", "status", run_dir, status)
+            for status in ("planning", "rendering", "ready", "typesetting", "layout_ready", "publishing"):
+                result = self.run_script(
+                    "run_context.py", "status", run_dir, status,
+                    "--actor", "wechat-leader",
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_published_requires_a_verified_durable_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("article\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init", "--mode", "newspic", "--account", "xiyue",
+                "--slug", "receipt", "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            run_dir = Path(json.loads(created.stdout)["run_dir"])
+            for status in ("planning", "rendering", "ready", "publishing"):
+                result = self.run_script(
+                    "run_context.py", "status", str(run_dir), status,
+                    "--actor", "wechat-leader",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            rejected = self.run_script(
+                "run_context.py", "status", str(run_dir), "published",
+                "--actor", "wechat-leader",
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("publish-result.json", rejected.stderr)
+
+    def test_publish_result_validator_accepts_verified_matching_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest_path = self.make_run(root, status="success")
+            run_dir = manifest_path.parent.parent
+            run_path = run_dir / ".pipeline" / "run.json"
+            run = json.loads(run_path.read_text())
+            run["status"] = "publishing"
+            run_path.write_text(json.dumps(run), encoding="utf-8")
+            manifest = json.loads(manifest_path.read_text())
+            image_path = Path(manifest["images"][0]["output_path"]).resolve()
+            source_path = Path(manifest["source"]["original_path"]).resolve()
+            (run_dir / ".pipeline" / "publish-result.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "ok": True,
+                    "protocol_version": "2026-07-13-001",
+                    "run_id": run["run_id"],
+                    "mode": "newspic",
+                    "account": "xiyue",
+                    "publish_fingerprint": "f" * 64,
+                    "draft_media_id": "draft-1",
+                    "creation_status": "created",
+                    "manifest_sha256": sha256(manifest_path),
+                    "source_sha256": sha256(source_path),
+                    "images": [{"path": str(image_path), "sha256": sha256(image_path)}],
+                    "uploaded_image_media_ids": ["image-1"],
+                    "verification": {
+                        "ok": True,
+                        "status": "verified",
+                        "method": "draft/get",
+                        "verified_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                }),
+                encoding="utf-8",
+            )
+            validated = self.run_script("validate_publish_result.py", str(run_dir))
+            self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
+            self.assertEqual(json.loads(validated.stdout)["draft_media_id"], "draft-1")
+
+    def test_mode_specific_state_machine_rejects_skipped_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("# Article\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init", "--mode", "news", "--account", "xiyue",
+                "--slug", "strict-state", "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            run_dir = json.loads(created.stdout)["run_dir"]
+            planning = self.run_script(
+                "run_context.py", "status", run_dir, "planning", "--actor", "wechat-leader"
+            )
+            self.assertEqual(planning.returncode, 0, planning.stderr)
+            skipped_render = self.run_script(
+                "run_context.py", "status", run_dir, "ready", "--actor", "wechat-leader"
+            )
+            self.assertNotEqual(skipped_render.returncode, 0)
+
+    def test_publish_result_rejects_skipped_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            run_dir = manifest_path.parent.parent
+            run_path = run_dir / ".pipeline" / "run.json"
+            run = json.loads(run_path.read_text())
+            run["status"] = "publishing"
+            run_path.write_text(json.dumps(run), encoding="utf-8")
+            receipt = {
+                "schema_version": 1,
+                "protocol_version": "2026-07-13-001",
+                "run_id": run["run_id"],
+                "mode": "newspic",
+                "account": "xiyue",
+                "publish_fingerprint": "f" * 64,
+                "draft_media_id": "draft-1",
+                "creation_status": "created",
+                "verification": {"ok": True, "status": "skipped"},
+            }
+            (run_dir / ".pipeline" / "publish-result.json").write_text(
+                json.dumps(receipt), encoding="utf-8"
+            )
+            result = self.run_script("validate_publish_result.py", str(run_dir))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("draft/get", result.stdout)
+
+    def test_newspic_dry_run_is_bound_to_manifest_text_and_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            run_dir = manifest_path.parent.parent
+            result = subprocess.run(
+                [
+                    PYTHON,
+                    str(ROOT / "skills" / "wechat-publisher" / "scripts" / "publish.py"),
+                    "newspic",
+                    "--manifest", str(manifest_path),
+                    "--account", "xiyue",
+                    "--result-output", str(run_dir / ".pipeline" / "publish-result.json"),
+                    "--verify-draft",
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(payload["draft"]["title"], "article")
+            self.assertEqual(
+                payload["draft"]["images"],
+                [str(Path(manifest["images"][0]["output_path"]).resolve())],
+            )
 
     def test_article_source_is_created_once_and_reused_after_designer_edits(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -186,7 +399,9 @@ class PipelineScriptTests(unittest.TestCase):
             run = json.loads(run_path.read_text(encoding="utf-8"))
             run["canonical_output_dir"] = str(root / "wrong-run")
             run_path.write_text(json.dumps(run), encoding="utf-8")
-            result = self.run_script("run_context.py", "seal", str(run_dir))
+            result = self.run_script(
+                "run_context.py", "seal", str(run_dir), "--actor", "wechat-leader"
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("canonical_output_dir", result.stderr)
 
@@ -204,9 +419,14 @@ class PipelineScriptTests(unittest.TestCase):
                 "--exports-root", str(root / "exports"),
             )
             run_dir = json.loads(created.stdout)["run_dir"]
-            planning = self.run_script("run_context.py", "status", run_dir, "planning")
+            planning = self.run_script(
+                "run_context.py", "status", run_dir, "planning",
+                "--actor", "wechat-leader",
+            )
             self.assertEqual(planning.returncode, 0, planning.stderr)
-            result = self.run_script("run_context.py", "seal", run_dir)
+            result = self.run_script(
+                "run_context.py", "seal", run_dir, "--actor", "wechat-leader"
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("cannot seal run while status is 'planning'", result.stderr)
 
@@ -256,7 +476,7 @@ class PipelineScriptTests(unittest.TestCase):
         started = written - timedelta(seconds=5) if attempt_before_prompt else written + timedelta(seconds=1)
         finished = started + timedelta(seconds=1)
         run = {
-            "protocol_version": "2026-07-12-001",
+            "protocol_version": "2026-07-13-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "account": "xiyue",
@@ -266,10 +486,13 @@ class PipelineScriptTests(unittest.TestCase):
             "status": "ready",
         }
         (pipeline / "run.json").write_text(json.dumps(run), encoding="utf-8")
+        (pipeline / "preflight.json").write_text(
+            json.dumps({"fallback_order": ["openai-native"]}), encoding="utf-8"
+        )
         verdict = "success" if status == "success" else "api_error"
         manifest = {
             "schema_version": 2,
-            "protocol_version": "2026-07-12-001",
+            "protocol_version": "2026-07-13-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "canonical_output_dir": str(run_dir),
@@ -340,6 +563,25 @@ class PipelineScriptTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_backend_alias_must_resolve_to_a_configured_preflight_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["images"][0]["attempts"][0]["backend"] = "imagegen"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            accepted = self.run_script(
+                "validate_designer_manifest.py", str(manifest_path), "--phase", "publish-ready"
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
+            manifest["images"][0]["attempts"][0]["backend"] = "unknown-provider"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            rejected = self.run_script(
+                "validate_designer_manifest.py", str(manifest_path), "--phase", "publish-ready"
+            )
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("was not configured by preflight", rejected.stdout)
+
     def test_extend_style_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             manifest_path = self.make_run(Path(temp), status="success")
@@ -373,6 +615,24 @@ class PipelineScriptTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1)
             self.assertIn("output hash mismatch", result.stdout)
+
+    def test_publish_ready_rejects_wrong_aspect_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            manifest = json.loads(manifest_path.read_text())
+            image_path = Path(manifest["images"][0]["output_path"])
+            wrong = (
+                b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
+                + struct.pack(">II", 400, 300) + b"\x08\x06\x00\x00\x00payload"
+            )
+            image_path.write_bytes(wrong)
+            manifest["images"][0]["output_sha256"] = sha256(image_path)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = self.run_script(
+                "validate_designer_manifest.py", str(manifest_path), "--phase", "publish-ready"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("do not match aspect", result.stdout)
 
     def test_publish_ready_rejects_publisher_text_hash_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -433,7 +693,7 @@ class PipelineScriptTests(unittest.TestCase):
         markdown.write_bytes(original.read_bytes())
         layout = {
             "schema_version": 1,
-            "protocol_version": "2026-07-12-001",
+            "protocol_version": "2026-07-13-001",
             "run_id": run["run_id"],
             "mode": "news",
             "canonical_output_dir": str(run_dir),
