@@ -21,6 +21,8 @@ background: false
 4. 不改写、润色、扩写或删减用户字句。明显错字只有在 Skill 原生流程允许且留下明确变更记录时才能修正。
 5. 不指定任何视觉风格，不创建图片或发布适配文件。
 
+完成后在 canonical 目录写入 `.pipeline/formatter-done.mark` 标记文件，便于 Leader 检测完成状态。
+
 回报必须包含 `protocol_version`、`run_id`、canonical 目录、读取的 Skill/reference、是否跳过以及真实自然产物路径。
 
 跳过时固定回报 `skipped: true`、`reason: already_structured_markdown`、`skill_files_read: []`、`natural_output_path: <run-dir>/.pipeline/input.md`。这表示复用 sealed input，不得声称调用过格式化 Skill 或生成过新文件。

@@ -53,7 +53,55 @@ If structured Skill inputs are unavailable, include both the exact namespaced Sk
 
 The worker must execute the attached Skill's current `SKILL.md`, references, and selected `EXTEND.md` natively. It must not reconstruct the workflow from this coordinator summary.
 
-After designer planning, run manifest validation with `--phase plan`, record a `validation.passed`/`validation.failed` event, set `rendering`, and resume the same Designer for generation. Do the same for `publish-ready`, layout, and publish-result gates, including the gate name and artifact path in event details. After typesetting, run `validate_article_layout.py` with the layout manifest and set `layout_ready`. A failed check goes back to the same worker; the Leader must not repair artifacts. Before Publisher dispatch set `publishing`; newspic must publish through `--manifest <run-dir>/.pipeline/manifest.json`. Require `.pipeline/publish-result.json` plus explicit `draft/get` verification, run `validate_publish_result.py <run-dir>`, and set `published` only after that gate passes. A `creation_status: unknown` receipt is a safety stop and must never trigger another `draft/add`.
+### Waiting Strategy (Phase 1 Optimization: Zero Long Sleep)
+
+**NEVER use sleep commands longer than 10 seconds.** `sleep 30`, `sleep 60`, `sleep 120`, `sleep 180` are all FORBIDDEN.
+
+After dispatching a worker, use only lightweight short-polling to wait for completion:
+1. Check for target files every 5 seconds (`sleep 5 && ls` or `sleep 5 && test -f`)
+2. Maximum 60 consecutive checks (5 minute total timeout)
+3. Reset the timeout counter whenever progress is detected (new file, new directory, file size change)
+4. Never "sleep for 2 minutes first then check"
+
+If no progress for 12 consecutive checks, message the worker to ask for status. Do not keep waiting silently.
+
+### Phase Overlap Strategy (Phase 3 Optimization: Typesetter Early Start)
+
+For `news` mode, Typesetter does NOT need to wait for all images to complete.
+
+Launch Typesetter when any of these conditions are met:
+1. Cover image + at least 1 inline image completed successfully
+2. OR >= 60% of total planned images are done
+3. OR Designer has been running for 2 minutes with at least 1 successful image
+
+After Typesetter is launched, **Designer can continue generating remaining images in the background** — they run in parallel.
+
+Typesetter requirements for partial run:
+1. Only reference successfully generated images (status = success in manifest)
+2. Leave placeholder `<section class="pending-image" data-image-id="xxx"></section>` for pending images
+3. Final HTML patch runs after all images complete
+
+This changes "generate 4 images → typeset entire article" from serial to parallel, saving ~1.5-2 minutes.
+
+### Phase 4 Optimization: Parallel Image Generation
+
+When dispatching Designer for news article illustrations, explicitly pass `--batch-size 4` to enable parallel image generation. The `baoyu-article-illustrator` skill natively supports batching up to 4 concurrent images when the runtime supports parallel tool calls.
+
+This changes 4 images from sequential (~1min × 4 = 4min) to parallel (~1min total), saving ~3 minutes.
+
+### Phase 5 Optimization: Concurrent Validation and Typesetting
+
+After **100% of images are complete**, launch both in parallel:
+1. Run `--phase publish-ready` manifest validation
+2. Set `typesetting` and dispatch Typesetter
+
+Do **NOT** wait for manifest validation to complete before launching Typesetter. Both must pass before advancing to Publisher.
+
+This saves the full manifest validation duration (~30 seconds) from the critical path.
+
+### Validation Gates
+
+After designer planning, run manifest validation with `--phase plan`, record a `validation.passed`/`validation.failed` event, set `rendering`, and resume the same Designer for generation. After all images complete, run `--phase publish-ready` **concurrently with typesetting**; do not block typesetting on manifest validation. After typesetting, run `validate_article_layout.py` with the layout manifest and set `layout_ready`. Both gates must pass before Publisher dispatch. A failed check goes back to the same worker; the Leader must not repair artifacts. Before Publisher dispatch set `publishing`; newspic must publish through `--manifest <run-dir>/.pipeline/manifest.json`. Require `.pipeline/publish-result.json` plus explicit `draft/get` verification, run `validate_publish_result.py <run-dir>`, and set `published` only after that gate passes. A `creation_status: unknown` receipt is a safety stop and must never trigger another `draft/add`.
 
 ## Finish
 
