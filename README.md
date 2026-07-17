@@ -254,7 +254,7 @@ Publisher 按以下优先级读取配置，前者覆盖后者：
 把 /absolute/path/article.md 排版成微信公众号文章，生成封面和必要插图，发布到 company 草稿箱
 ```
 
-如果输入已经具有可用的 Markdown 标题或 frontmatter，Formatter 会明确标记为 skipped，不生成占位文件。流水线随后创建一次 `article-source.md` 工作副本，让 Baoyu article-illustrator 原生插入图片引用；不可变原稿始终保留在 `.pipeline/input.md`。Designer 完成图片后，Typesetter 直接执行内置 `gzh-design`：用户指定主题时按指定主题，未指定时按文章题材自动选择；最终只把通过双重 HTML 门禁的正文片段交给 Publisher。
+如果输入已经具有可用的 Markdown 标题或 frontmatter，Formatter 会明确标记为 skipped，不生成占位文件。流水线随后创建一次 `article-source.md` 工作副本，让 Baoyu article-illustrator 原生插入图片引用；不可变原稿始终保留在 `.pipeline/input.md`。Typesetter 可在 Designer 生成过程中提前启动，与剩余图片生成并行；未完成的图片先留占位符，全部生成后补全 HTML。图片全部完成后，publish-ready 校验与 `gzh-design` 排版并发执行：用户指定主题时按指定主题，未指定时按文章题材自动选择；最终只把通过双重 HTML 门禁的正文片段交给 Publisher。
 
 ### 只使用 Publisher
 
@@ -288,10 +288,13 @@ flowchart LR
     F --> P1["Designer 规划 prompt"]
     P1 --> V1["Plan 校验"]
     V1 --> G["执行 Baoyu Skill 生图"]
-    G --> V2["Publish-ready 校验"]
-    V2 --> T["Typesetter 执行 gzh-design"]
+    G --> J1{"图片全部完成"}
+    J1 --> V2["Publish-ready 校验"]
+    J1 --> T["Typesetter 执行 gzh-design"]
     T --> LV["Layout HTML 校验"]
-    LV --> P2["Publisher 上传图片并替换 src"]
+    V2 --> J2{"双门禁通过"}
+    LV --> J2
+    J2 --> P2["Publisher 上传图片并替换 src"]
     P2 --> W["创建唯一草稿并原子写回执"]
     W --> RV["draft/get 回读验收"]
     RV --> DONE["published"]
