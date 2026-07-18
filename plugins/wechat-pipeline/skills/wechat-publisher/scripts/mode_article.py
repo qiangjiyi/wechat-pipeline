@@ -18,6 +18,7 @@ from lib.env_loader import merged_env
 from lib.errors import PublishError, RetryablePublishError
 from lib.html_article import inspect_html, upload_html_images
 from lib.draft_verifier import verify_article_draft
+from lib.pipeline_snapshot import load_pipeline_snapshot
 from lib.proxy_client import (
     add_draft,
     get_draft,
@@ -220,6 +221,22 @@ def _run_html(args, html_path: Path) -> int:
     proxy_url = env.get("WECHAT_PROXY_URL", "").strip()
     cover_path, cover_source = _resolve_html_cover(args, metadata, base_dir)
     result_path = resolve_result_path(getattr(args, "result_output", None))
+    snapshot_binding = None
+    if manifest_path:
+        snapshot_binding = load_pipeline_snapshot(getattr(args, "snapshot", None), base_dir, "news")
+        if snapshot_binding["account"] != account:
+            raise PublishError("selected account does not match publish snapshot")
+        publication = snapshot_binding["data"].get("publication") or {}
+        expected_metadata = (
+            str(publication.get("title") or "").strip(),
+            str(publication.get("author") or "").strip(),
+            str(publication.get("summary") or "").strip(),
+        )
+        if (title, author, summary) != expected_metadata:
+            raise PublishError("article metadata does not match publish snapshot")
+        expected_cover = Path(str((snapshot_binding["data"].get("cover") or {}).get("path", ""))).expanduser().resolve()
+        if cover_path is None or cover_path.resolve() != expected_cover:
+            raise PublishError("article cover does not match publish snapshot")
     verify_draft = bool(getattr(args, "verify_draft", False))
     if verify_draft and result_path is None:
         raise PublishError("--verify-draft requires --result-output so a created draft cannot be duplicated")
@@ -235,6 +252,8 @@ def _run_html(args, html_path: Path) -> int:
         "html_sha256": hashlib.sha256(html.encode("utf-8")).hexdigest(),
         "layout_sha256": sha256_file(manifest_path) if manifest_path else None,
         "cover_sha256": sha256_file(cover_path) if cover_path else None,
+        "snapshot_sha256": snapshot_binding["sha256"] if snapshot_binding else None,
+        "snapshot_fingerprint": snapshot_binding["fingerprint"] if snapshot_binding else None,
         "run_identity": identity,
     })
 
@@ -312,6 +331,8 @@ def _run_html(args, html_path: Path) -> int:
     binding_fields = {
         "layout_sha256": sha256_file(manifest_path) if manifest_path else None,
         "html_sha256": sha256_file(html_path),
+        "snapshot_sha256": snapshot_binding["sha256"] if snapshot_binding else None,
+        "snapshot_fingerprint": snapshot_binding["fingerprint"] if snapshot_binding else None,
     }
     uploaded_body_images = dict((checkpoint or {}).get("uploaded_body_images") or {})
 

@@ -407,6 +407,25 @@ class PublisherInputTests(unittest.TestCase):
         )
         self.assertTrue(result["ok"], result)
 
+    def test_draft_readback_accepts_wechat_data_src_images(self) -> None:
+        source = '<section><p><span leaf="">正文。</span></p><img src="local.png"></section>'
+        draft = {
+            "news_item": [{
+                "title": "Title",
+                "digest": "Summary",
+                "content": '<section><p><span leaf="">正文。</span></p>'
+                '<img data-src="https://mmbiz.qpic.cn/body"></section>',
+            }]
+        }
+        result = verify_article_draft(
+            draft,
+            title="Title",
+            summary="Summary",
+            source_html=source,
+            expected_image_count=1,
+        )
+        self.assertTrue(result["ok"], result)
+
     def test_article_html_dry_run_does_not_use_markdown_renderer(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -452,7 +471,7 @@ class PublisherInputTests(unittest.TestCase):
             pipeline.mkdir(parents=True)
             original = pipeline / "input.md"
             original.write_text("# 标题\n\n正文。\n", encoding="utf-8")
-            markdown = run_dir / "article-source.md"
+            markdown = run_dir / "content.md"
             markdown.write_bytes(original.read_bytes())
             article = run_dir / "article-body.html"
             article.write_text(
@@ -460,8 +479,12 @@ class PublisherInputTests(unittest.TestCase):
             )
             cover = run_dir / "cover.png"
             cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
+            (pipeline / "manifest.json").write_text(
+                json.dumps({"images": [{"id": "00", "kind": "cover", "output_path": str(cover)}]}),
+                encoding="utf-8",
+            )
             run = {
-                "protocol_version": "2026-07-13-001",
+                "protocol_version": "2026-07-18-001",
                 "run_id": "run",
                 "canonical_output_dir": str(run_dir),
             }
@@ -473,7 +496,7 @@ class PublisherInputTests(unittest.TestCase):
             sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
             layout = {
                 "schema_version": 1,
-                "protocol_version": "2026-07-13-001",
+                "protocol_version": "2026-07-18-001",
                 "run_id": "run",
                 "mode": "news",
                 "canonical_output_dir": str(run_dir),
@@ -521,11 +544,29 @@ class PublisherInputTests(unittest.TestCase):
             args = Namespace(
                 markdown=None, markdown_pos=None, html=str(article),
                 layout_manifest=str(layout_path), theme=None, color=None, no_cite=False,
+                snapshot=str(pipeline / "publish-snapshot.json"),
                 title=None, author=None, summary=None, cover=None, account="personal",
                 env_file=str(env_file), dry_run=True, yes=True,
             )
             output = io.StringIO()
-            with redirect_stdout(output):
+            with (
+                mock.patch.object(
+                    mode_article,
+                    "load_pipeline_snapshot",
+                    return_value={
+                        "account": "personal", "sha256": "a" * 64, "fingerprint": "b" * 64,
+                        "data": {
+                            "publication": {
+                                "title": "Manifest title",
+                                "author": "Manifest author",
+                                "summary": "Manifest summary",
+                            },
+                            "cover": {"path": str(cover)},
+                        },
+                    },
+                ),
+                redirect_stdout(output),
+            ):
                 result = mode_article.run(args)
             self.assertEqual(result, 0)
             payload = json.loads(output.getvalue())

@@ -1,58 +1,29 @@
 ---
 name: wechat-designer
-description: Worker for a wechat-leader-owned run. Executes the current Baoyu image skill natively, preserves its natural outputs, and records hidden pipeline evidence. Rejects dispatches without protocol_version, run_id and canonical_output_dir.
+description: Plans and renders all images for one leader-owned WeChat run from immutable content.md, using native Baoyu skills and truthful per-image evidence.
 disallowedTools: Agent
 background: false
 ---
 
 # wechat-designer
 
-你只接受 `wechat-pipeline:wechat-leader` 派工；仓库软链接开发模式下也接受 `wechat-leader`。
+读取 V2 协议，要求 `protocol_version: 2026-07-18-001`。只接受 `wechat-leader` 在 `planning` 或 `rendering` 状态的派工。输入固定为只读 `<run-dir>/content.md`。
 
-从 Leader 派工读取绝对 `PIPELINE_ROOT`；Plugin 模式下若 `${CLAUDE_PLUGIN_ROOT}` 存在，两者必须解析为同一路径，否则返回 `contract_error`。不自行猜测或扫描根目录。然后完整读取 `${PIPELINE_ROOT}/docs/wechat-pipeline-protocol.md`，协议版本必须是 `2026-07-13-001`。
+## Planning
 
-## 输入门禁
+- 先运行 `preflight_image_backends.py` 和 `load_extend.py`。
+- newspic 原生执行 `baoyu-xhs-images`，aspect 3:4。
+- news 原生执行 `baoyu-cover-image` 和 `baoyu-article-illustrator`，封面 2.35:1、正文 16:9。
+- prompt 必须先真实落盘，再记录 hash 和时间。
+- 写 schema 3 manifest，包含 `plan.image_count`；newspic 包含 `card_count`，news 包含 `cover_count: 1` 和 `body_count`。
+- planning 阶段不调用图片 backend，不伪造 attempt。
 
-派工必须包含 `PIPELINE_ROOT`、`run_id`、`canonical_output_dir`、`<run-dir>/.pipeline/input.md`、`mode` 和用户明确参数。news 还必须包含 `<run-dir>/article-source.md`；它是唯一允许 article-illustrator 插入 Markdown 图片引用的工作副本。缺任一项、路径不在 canonical 目录或版本不一致，立即返回 `contract_error`。不得自建目录。
+## Rendering
 
-## 执行（Phase 2 优化：Worker 自验自修复，只返回最终结果）
+- Leader 门禁通过并恢复本 Worker 后，原生执行 `baoyu-image-gen`。
+- 可以在同一 Worker 内并行调用最多 3 个不同图片任务；每个任务只写自己的输出。
+- 同一图片 fallback 必须复用 prompt hash。
+- batch 完成后单次汇总 manifest，不让并行任务同时写 manifest。
+- backend 全部失败则图片失败；禁止 placeholder、空白图、PIL 补图或把失败写成 success。
 
-1. 运行 `"${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/scripts/preflight_image_backends.py" --output <run-dir>/.pipeline/preflight.json`。完整解析 provider 配置，不用 `head` 或截断检查。
-2. 先用确定性脚本解析 EXTEND.md，再按模式完整调用本 Plugin 内置的 `wechat-pipeline:baoyu-xhs-images` / `wechat-pipeline:baoyu-cover-image` / `wechat-pipeline:baoyu-article-illustrator`；软链接开发模式可使用对应无命名空间 Skill。
-   ```bash
-   "${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/scripts/load_extend.py" <skill-name> --base-dir <run-dir> --json
-   ```
-   - **命中**：直接读取脚本返回的绝对 `path` 与 `sha256`，**跳过 Skill 内部的三级路径查找**（那套查找依赖 shell 参数展开，不可靠）；遵守其当前 `SKILL.md`、references 和该 EXTEND.md。
-   - **未命中 + 非交互**（newspic `--yes`、news 封面 `--quick`、内联图“直接生成”）：**不得**触发 first-time setup，**不得**阻塞或返回 `contract_error`；改用 Skill 内置默认值，`preferences.source` 设为 `auto`，`extend_path` 留空。即便 Skill 自身 Step 0 写着“未命中必须先完成 setup”，在非交互流水线下也被本规则覆盖。
-   - **未命中 + 交互**：可按 Skill 的 first-time setup 流程保存 EXTEND.md，保存后重跑 `load_extend.py` 取回命中路径再继续。
-   news 的 article-illustrator 输入固定为 `article-source.md`，让原 Skill 原生插入图片引用；不得修改只读 `.pipeline/input.md`。
-3. 用户未明确覆盖时，不指定风格、调色、布局或图片数量；使用 Skill 分析和 EXTEND。
-4. 使用原生非交互信号：newspic 为 `--yes --aspect 3:4`；news 封面为 `--quick --aspect 2.35:1`；内联图为“直接生成 --batch-size 4 并行 4 张一起生成”，aspect `16:9`。
-5. 保留 Skill 的自然文件名与目录。禁止为了 pipeline 重命名/复制 prompt 或图片，禁止补假的 analysis/outline/batch。
-6. 在 `.pipeline/manifest.json` 记录 Skill/EXTEND 的路径与 sha256、真实 prompt、真实图片和真实 per-image attempts。EXTEND 的 `extend_path`/`extend_sha256` **仅在 `load_extend.py` 命中时**记录，此时 `preferences.source=extend`；未命中时 `preferences.source=auto` 且 `extend_path` 留空（null 或省略），不得写入未解析的候选路径。
-7. 通用 smoke test 只记入 `preflight.json`，不得复制成图片 attempts。
-
-### 自验自修复循环（必须遵守）
-
-8. 首轮只完成 prompt 与 manifest 规划，规划完成后**立即自验**：
-   ```bash
-   "${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/scripts/validate_designer_manifest.py" \
-     <run-dir>/.pipeline/manifest.json --phase plan
-   ```
-   - 验证失败：**自己修复 manifest**（补全缺失字段、修正路径格式），最多重试 3 次
-   - 验证通过后再回报 Leader；Leader 完成校验并把状态设为 `rendering` 后，恢复运行开始真实生图
-9. 全部图片生成完成后**立即自验**：
-   ```bash
-   "${PIPELINE_ROOT}/scripts/run_python.sh" "${PIPELINE_ROOT}/scripts/validate_designer_manifest.py" \
-     <run-dir>/.pipeline/manifest.json --phase publish-ready
-   ```
-   - 验证失败：**自己修复问题**（补缺失的图片 hash、修正 attempt 记录、补零字节图），最多重试 3 次
-   - 每张图失败最多 fallback 2 次，超过则标记整张图失败
-   - 验证完全通过后再回报 Leader
-
-10. provider/model 不兼容记为 `api_error` 并继续 fallback；只有输入、Skill、运行上下文缺失，或 `preferences.source=extend` 但 EXTEND.md 实际丢失，才是 `contract_error`。**非交互模式下 EXTEND.md 未命中不是 `contract_error`**（`load_extend.py` 未命中即回退内置默认，`source=auto`，继续生成）。attempt 的 backend 使用 preflight 中的规范名称；宿主 `imagegen` 工具统一记录为 `openai-native`，具体适配器可另记 `adapter: imagegen`。
-11. 规划完成、每张图完成及全部完成时调用 `run_context.py progress`，以 `wechat-designer` 为 actor 更新当前数量；不得用 progress 修改 run 状态。
-
-同一张图 fallback 时必须复用相同 prompt hash。需要改变 prompt，停止并交 Leader 决策。
-
-回报必须包含 `protocol_version`、`run_id`、canonical 目录、读取的 Skill/reference/EXTEND（含 `load_extend.py` 解析结果：命中 source/path 或未命中回退 auto）、偏好来源、provider 链、manifest 路径、当前阶段、修复重试次数。**验证完全通过后才返回 Leader**。worker 不得调用 `run_context.py status`；失败时只报告真实错误，由 Leader 写入 `failed` 状态。
+不修改 `content.md`、run 状态、Plugin 或其他 Worker 产物。回报真实 provider 链、manifest 和失败信息；由 Leader 运行门禁。

@@ -105,6 +105,24 @@ def validate_gzh_snapshot() -> str | None:
     return None
 
 
+def validate_baoyu_snapshots() -> list[str]:
+    lock_path = PLUGIN_ROOT / "third_party" / "baoyu-skills.lock.json"
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        return [f"unable to read bundled Baoyu lock: {err}"]
+    errors: list[str] = []
+    for name, metadata in (lock.get("skills") or {}).items():
+        skill_root = PLUGIN_ROOT / "skills" / name
+        if not skill_root.is_dir():
+            errors.append(f"bundled Baoyu Skill is missing: {name}")
+            continue
+        actual = tree_sha256(skill_root)
+        if actual != metadata.get("tree_sha256"):
+            errors.append(f"bundled Baoyu Skill hash does not match its lock: {name}")
+    return errors
+
+
 def doctor(args: argparse.Namespace) -> int:
     config_path = resolve_env_file(args.env_file)
     file_values = load_dotenv(config_path)
@@ -139,6 +157,7 @@ def doctor(args: argparse.Namespace) -> int:
         gzh_error = validate_gzh_snapshot()
         if gzh_error:
             errors.append(gzh_error)
+    errors.extend(validate_baoyu_snapshots())
 
     # Check exports directory alignment with global workspace convention
     exports_root = Path(

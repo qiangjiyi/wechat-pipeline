@@ -8,7 +8,8 @@ import hashlib
 import json
 import struct
 import sys
-from datetime import datetime
+import zlib
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from protocol_version import PROTOCOL_VERSION
@@ -37,6 +38,7 @@ REQUIRED_TOP_LEVEL = {
     "canonical_output_dir",
     "source",
     "skill_contract",
+    "plan",
     "images",
 }
 REQUIRED_IMAGE_FIELDS = {
@@ -59,6 +61,12 @@ REQUIRED_ATTEMPT_FIELDS = {
     "finished_at",
     "verdict",
     "error_summary",
+}
+MIN_PNG_BYTES = 4096
+MIN_DIMENSIONS = {
+    "card": (900, 1200),
+    "cover": (900, 380),
+    "body": (1200, 675),
 }
 
 
@@ -88,22 +96,139 @@ def parse_time(value: Any, label: str, errors: list[str]) -> datetime | None:
         return None
 
 
-def is_png(path: Path) -> bool:
-    if not path.is_file() or path.stat().st_size <= len(PNG_SIGNATURE):
-        return False
-    with path.open("rb") as handle:
-        return handle.read(len(PNG_SIGNATURE)) == PNG_SIGNATURE
+def _paeth(left: int, up: int, upper_left: int) -> int:
+    estimate = left + up - upper_left
+    left_distance = abs(estimate - left)
+    up_distance = abs(estimate - up)
+    upper_left_distance = abs(estimate - upper_left)
+    if left_distance <= up_distance and left_distance <= upper_left_distance:
+        return left
+    return up if up_distance <= upper_left_distance else upper_left
 
 
-def png_dimensions(path: Path) -> tuple[int, int] | None:
+def inspect_png(path: Path) -> tuple[tuple[int, int] | None, bool | None, list[str]]:
+    """Validate PNG chunks/pixels and report whether every visible pixel is identical."""
     try:
-        with path.open("rb") as handle:
-            header = handle.read(24)
-    except OSError:
-        return None
-    if len(header) < 24 or not header.startswith(PNG_SIGNATURE) or header[12:16] != b"IHDR":
-        return None
-    return struct.unpack(">II", header[16:24])
+        payload = path.read_bytes()
+    except OSError as err:
+        return None, None, [f"unable to read PNG: {err}"]
+    if not payload.startswith(PNG_SIGNATURE):
+        return None, None, ["missing PNG signature"]
+
+    offset = len(PNG_SIGNATURE)
+    ihdr: bytes | None = None
+    idat: list[bytes] = []
+    saw_iend = False
+    errors: list[str] = []
+    while offset < len(payload):
+        if offset + 12 > len(payload):
+            errors.append("truncated PNG chunk header")
+            break
+        length = struct.unpack(">I", payload[offset:offset + 4])[0]
+        chunk_type = payload[offset + 4:offset + 8]
+        chunk_end = offset + 12 + length
+        if chunk_end > len(payload):
+            errors.append("truncated PNG chunk payload")
+            break
+        chunk_data = payload[offset + 8:offset + 8 + length]
+        recorded_crc = struct.unpack(">I", payload[offset + 8 + length:chunk_end])[0]
+        actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+        if recorded_crc != actual_crc:
+            errors.append(f"invalid PNG CRC for {chunk_type.decode('ascii', errors='replace')}")
+        if chunk_type == b"IHDR":
+            if ihdr is not None or offset != len(PNG_SIGNATURE) or length != 13:
+                errors.append("PNG must begin with exactly one 13-byte IHDR chunk")
+            ihdr = chunk_data
+        elif chunk_type == b"IDAT":
+            idat.append(chunk_data)
+        elif chunk_type == b"IEND":
+            if length != 0:
+                errors.append("PNG IEND chunk must be empty")
+            saw_iend = True
+            offset = chunk_end
+            if offset != len(payload):
+                errors.append("PNG contains trailing bytes after IEND")
+            break
+        offset = chunk_end
+
+    if ihdr is None:
+        return None, None, errors + ["missing PNG IHDR chunk"]
+    width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(">IIBBBBB", ihdr)
+    dimensions = (width, height)
+    if width <= 0 or height <= 0:
+        errors.append("PNG dimensions must be positive")
+    if not idat:
+        errors.append("missing PNG IDAT data")
+    if not saw_iend:
+        errors.append("missing PNG IEND chunk")
+    if compression != 0 or filter_method != 0 or interlace not in {0, 1}:
+        errors.append("unsupported PNG compression, filter, or interlace method")
+    valid_depths = {
+        0: {1, 2, 4, 8, 16},
+        2: {8, 16},
+        3: {1, 2, 4, 8},
+        4: {8, 16},
+        6: {8, 16},
+    }
+    if bit_depth not in valid_depths.get(color_type, set()):
+        errors.append(f"unsupported PNG color type/bit depth: {color_type}/{bit_depth}")
+    if errors or interlace != 0:
+        return dimensions, None, errors
+
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+    bits_per_pixel = channels * bit_depth
+    stride = (width * bits_per_pixel + 7) // 8
+    bytes_per_pixel = max(1, (bits_per_pixel + 7) // 8)
+    expected_size = height * (stride + 1)
+    if expected_size > 300 * 1024 * 1024:
+        return dimensions, None, ["PNG decoded pixel data exceeds the 300 MiB safety limit"]
+    try:
+        decoded = zlib.decompress(b"".join(idat))
+    except zlib.error as err:
+        return dimensions, None, [f"invalid PNG compressed pixel data: {err}"]
+    if len(decoded) != expected_size:
+        return dimensions, None, [
+            f"PNG decoded pixel length mismatch: expected {expected_size} got {len(decoded)}"
+        ]
+
+    rows: list[bytes] = []
+    prior = bytearray(stride)
+    cursor = 0
+    for row_index in range(height):
+        filter_type = decoded[cursor]
+        scanline = decoded[cursor + 1:cursor + 1 + stride]
+        cursor += stride + 1
+        if filter_type > 4:
+            return dimensions, None, [f"invalid PNG filter type {filter_type} on row {row_index}"]
+        restored = bytearray(stride)
+        for index, value in enumerate(scanline):
+            left = restored[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            up = prior[index]
+            upper_left = prior[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            predictor = (0, left, up, (left + up) // 2, _paeth(left, up, upper_left))[filter_type]
+            restored[index] = (value + predictor) & 0xFF
+        rows.append(bytes(restored))
+        prior = restored
+
+    flat: bool | None = None
+    if bit_depth in {8, 16} and color_type in {0, 2, 4, 6}:
+        pixel_size = channels * (bit_depth // 8)
+        first = rows[0][:pixel_size]
+        flat = all(
+            row[index:index + pixel_size] == first
+            for row in rows
+            for index in range(0, len(row), pixel_size)
+        )
+        if color_type in {4, 6}:
+            alpha_offset = (channels - 1) * (bit_depth // 8)
+            alpha_size = bit_depth // 8
+            if all(
+                row[index + alpha_offset:index + alpha_offset + alpha_size] == b"\x00" * alpha_size
+                for row in rows
+                for index in range(0, len(row), pixel_size)
+            ):
+                errors.append("PNG is fully transparent")
+    return dimensions, flat, errors
 
 
 def expected_ratio(value: str) -> float | None:
@@ -250,6 +375,10 @@ def validate_image(
             errors.append(f"prompt hash mismatch: {prompt_path}")
 
     prompt_written_at = parse_time(image["prompt_written_at"], f"{label}.prompt_written_at", errors)
+    if prompt_path.is_file() and prompt_written_at:
+        actual_written_at = datetime.fromtimestamp(prompt_path.stat().st_mtime, tz=prompt_written_at.tzinfo)
+        if actual_written_at > prompt_written_at + timedelta(seconds=5):
+            errors.append(f"{label}.prompt_written_at predates the prompt file modification time")
     attempts = image.get("attempts")
     if not isinstance(attempts, list):
         errors.append(f"{label}.attempts must be a list")
@@ -271,6 +400,8 @@ def validate_image(
             errors.append(f"{attempt_label} invalid verdict: {attempt.get('verdict')!r}")
         backend = str(attempt.get("backend", ""))
         canonical_backend = BACKEND_ALIASES.get(backend, backend)
+        if canonical_backend == "placeholder":
+            errors.append(f"{attempt_label}.backend placeholder is never publishable")
         if canonical_backend not in configured_backends:
             errors.append(
                 f"{attempt_label}.backend was not configured by preflight: {backend!r}"
@@ -294,12 +425,19 @@ def validate_image(
         errors.append(f"{label} is not publish-ready: status={image.get('status')!r}")
     if not attempts or attempts[-1].get("verdict") != "success":
         errors.append(f"{label} last attempt must have verdict success")
-    if not is_png(output_path):
-        errors.append(f"output is not a valid non-empty PNG: {output_path}")
-    elif sha256_file(output_path) != image.get("output_sha256"):
-        errors.append(f"output hash mismatch: {output_path}")
+    if not output_path.is_file():
+        errors.append(f"output PNG not found: {output_path}")
     else:
-        dimensions = png_dimensions(output_path)
+        if output_path.stat().st_size < MIN_PNG_BYTES:
+            errors.append(
+                f"output PNG is too small to be a publishable image: {output_path.stat().st_size} bytes"
+            )
+        if sha256_file(output_path) != image.get("output_sha256"):
+            errors.append(f"output hash mismatch: {output_path}")
+        dimensions, flat, png_errors = inspect_png(output_path)
+        errors.extend(f"invalid output PNG {output_path}: {error}" for error in png_errors)
+        if flat:
+            errors.append(f"output PNG is a single-color blank image: {output_path}")
         ratio = expected_ratio(str(image.get("aspect", "")))
         if dimensions is None:
             errors.append(f"output PNG is missing a valid IHDR dimension header: {output_path}")
@@ -311,6 +449,62 @@ def validate_image(
                 errors.append(
                     f"{label} dimensions {dimensions[0]}x{dimensions[1]} do not match aspect {image.get('aspect')}"
                 )
+            mode = str((load_json(canonical_dir / ".pipeline" / "run.json")).get("mode", ""))
+            kind = str(image.get("kind", ""))
+            dimension_key = "card" if mode == "newspic" else ("cover" if kind == "cover" else "body")
+            minimum = MIN_DIMENSIONS[dimension_key]
+            if dimensions[0] < minimum[0] or dimensions[1] < minimum[1]:
+                errors.append(
+                    f"{label} dimensions {dimensions[0]}x{dimensions[1]} are below minimum {minimum[0]}x{minimum[1]}"
+                )
+
+
+def validate_mode_contract(manifest: dict, errors: list[str]) -> None:
+    mode = manifest.get("mode")
+    images = manifest.get("images") if isinstance(manifest.get("images"), list) else []
+    plan = manifest.get("plan") if isinstance(manifest.get("plan"), dict) else {}
+    if plan.get("image_count") != len(images):
+        errors.append("plan.image_count must equal the number of manifest images")
+    if mode == "newspic":
+        if not 1 <= len(images) <= 20:
+            errors.append("newspic requires 1-20 card images")
+        if plan.get("card_count") != len(images):
+            errors.append("newspic plan.card_count must equal the number of images")
+        for index, image in enumerate(images, start=1):
+            if not isinstance(image, dict):
+                continue
+            if image.get("kind") != "card":
+                errors.append(f"images[{index}].kind must be card in newspic mode")
+            if image.get("source_skill") != "baoyu-xhs-images":
+                errors.append(f"images[{index}].source_skill must be baoyu-xhs-images")
+            if image.get("aspect") != "3:4":
+                errors.append(f"images[{index}].aspect must be 3:4 in newspic mode")
+    elif mode == "news":
+        covers = [image for image in images if isinstance(image, dict) and image.get("kind") == "cover"]
+        bodies = [image for image in images if isinstance(image, dict) and image.get("kind") != "cover"]
+        if len(covers) != 1:
+            errors.append("news requires exactly one cover image")
+        if not bodies:
+            errors.append("news requires at least one body illustration")
+        if plan.get("cover_count") != 1 or plan.get("body_count") != len(bodies):
+            errors.append("news plan counts must declare one cover and every body illustration")
+        for index, image in enumerate(images, start=1):
+            if not isinstance(image, dict):
+                continue
+            if image.get("kind") == "cover":
+                if image.get("source_skill") != "baoyu-cover-image":
+                    errors.append(f"images[{index}] cover must come from baoyu-cover-image")
+                if image.get("aspect") != "2.35:1":
+                    errors.append(f"images[{index}] cover aspect must be 2.35:1")
+            else:
+                if image.get("kind") not in {"inline", "scene"}:
+                    errors.append(f"images[{index}].kind must be inline or scene for a news body image")
+                if image.get("source_skill") != "baoyu-article-illustrator":
+                    errors.append(f"images[{index}] body image must come from baoyu-article-illustrator")
+                if image.get("aspect") != "16:9":
+                    errors.append(f"images[{index}] body image aspect must be 16:9")
+    else:
+        errors.append(f"manifest.mode must be newspic or news, got {mode!r}")
 
 
 def validate(manifest_path: Path, phase: str) -> list[str]:
@@ -356,6 +550,7 @@ def validate(manifest_path: Path, phase: str) -> list[str]:
 
     validate_source(manifest, base_dir, phase, errors)
     validate_skill_contract(manifest, base_dir, errors)
+    validate_mode_contract(manifest, errors)
     images = manifest.get("images")
     if not isinstance(images, list) or not images:
         errors.append("manifest.images must be a non-empty list")

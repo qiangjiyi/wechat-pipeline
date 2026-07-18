@@ -34,6 +34,7 @@ def validate(run_dir: Path) -> tuple[list[str], dict | None]:
     pipeline = run_dir / ".pipeline"
     run_path = pipeline / "run.json"
     receipt_path = pipeline / "publish-result.json"
+    snapshot_path = pipeline / "publish-snapshot.json"
     try:
         run = load(run_path)
     except (OSError, ValueError, json.JSONDecodeError) as err:
@@ -46,8 +47,8 @@ def validate(run_dir: Path) -> tuple[list[str], dict | None]:
         errors.append(f"run protocol_version must be {PROTOCOL_VERSION}")
     if Path(str(run.get("canonical_output_dir", ""))).expanduser().resolve() != run_dir:
         errors.append("run canonical_output_dir does not match the requested directory")
-    if run.get("status") != "publishing":
-        errors.append("run must be in publishing state before publish receipt validation")
+    if run.get("status") not in {"publishing", "published"}:
+        errors.append("run must be publishing or published for publish receipt validation")
     if receipt.get("schema_version") != 1:
         errors.append("publish receipt schema_version must be 1")
     if receipt.get("ok") is not True:
@@ -58,6 +59,20 @@ def validate(run_dir: Path) -> tuple[list[str], dict | None]:
         errors.append("publish receipt run_id does not match run.json")
     if receipt.get("account") != run.get("account"):
         errors.append("publish receipt account does not match run.json")
+    try:
+        snapshot = load(snapshot_path)
+    except (OSError, ValueError, json.JSONDecodeError) as err:
+        errors.append(f"unable to read publish snapshot: {err}")
+        snapshot = {}
+    else:
+        from build_publish_snapshot import validate_snapshot
+
+        snapshot_errors, _ = validate_snapshot(run_dir)
+        errors.extend(snapshot_errors)
+        if receipt.get("snapshot_sha256") != sha256_file(snapshot_path):
+            errors.append("publish receipt snapshot_sha256 does not match publish-snapshot.json")
+        if receipt.get("snapshot_fingerprint") != snapshot.get("fingerprint"):
+            errors.append("publish receipt snapshot_fingerprint does not match publish snapshot")
     expected_modes = {"newspic"} if run.get("mode") == "newspic" else {"article-html"}
     if receipt.get("mode") not in expected_modes:
         errors.append("publish receipt mode does not match run.json")
@@ -107,6 +122,14 @@ def validate(run_dir: Path) -> tuple[list[str], dict | None]:
             errors.append("publish receipt layout_sha256 does not match layout.json")
         if not html_path.is_file() or receipt.get("html_sha256") != sha256_file(html_path):
             errors.append("publish receipt html_sha256 does not match article-body.html")
+        body_images = snapshot.get("body_images") if isinstance(snapshot.get("body_images"), list) else []
+        if receipt.get("body_image_count") != len(body_images):
+            errors.append("publish receipt body_image_count does not match publish snapshot")
+        if receipt.get("uploaded_body_image_count") != len(body_images):
+            errors.append("publish receipt uploaded body image count is incomplete")
+        cover = snapshot.get("cover") if isinstance(snapshot.get("cover"), dict) else {}
+        if Path(str(receipt.get("cover_path", ""))).expanduser().resolve() != Path(str(cover.get("path", ""))).expanduser().resolve():
+            errors.append("publish receipt cover_path does not match publish snapshot")
     return errors, receipt
 
 

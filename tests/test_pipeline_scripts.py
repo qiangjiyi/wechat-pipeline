@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,13 +16,47 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "plugins" / "wechat-pipeline"
 PYTHON = sys.executable
-PNG = (
-    b"\x89PNG\r\n\x1a\n"
-    + b"\x00\x00\x00\rIHDR"
-    + struct.pack(">II", 300, 400)
-    + b"\x08\x06\x00\x00\x00"
-    + b"test-png-payload"
-)
+
+
+def fake_png(width: int, height: int) -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload)) + kind + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            rows.extend(((x + y) & 0xFF, (2 * x + y) & 0xFF, (x + 3 * y) & 0xFF))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(rows), level=1))
+        + chunk(b"IEND", b"")
+    )
+
+
+def solid_png(width: int, height: int) -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload)) + kind + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    rows = b"".join(b"\x00" + b"\xff\xff\xff" * width for _ in range(height))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+PNG = fake_png(900, 1200)
 
 
 def sha256(path: Path) -> str:
@@ -36,6 +71,93 @@ class PipelineScriptTests(unittest.TestCase):
             text=True,
             check=False,
         )
+
+    def make_v2_newspic_run(self, root: Path) -> tuple[Path, Path]:
+        source = root / "source.md"
+        source.write_text("# Article\n\nBody.\n", encoding="utf-8")
+        created = self.run_script(
+            "run_context.py", "init", "--mode", "newspic", "--account", "xiyue",
+            "--slug", "v2-newspic", "--source", str(source),
+            "--exports-root", str(root / "exports"),
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        run_dir = Path(json.loads(created.stdout)["run_dir"])
+        for status in ("formatting",):
+            moved = self.run_script(
+                "run_context.py", "status", str(run_dir), status, "--actor", "wechat-leader"
+            )
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+        prepared = self.run_script(
+            "prepare_content.py", str(run_dir), "--source", str(run_dir / ".pipeline" / "input.md")
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        for status in ("content_ready", "planning"):
+            moved = self.run_script(
+                "run_context.py", "status", str(run_dir), status, "--actor", "wechat-leader"
+            )
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+
+        pipeline = run_dir / ".pipeline"
+        (pipeline / "preflight.json").write_text(
+            json.dumps({"fallback_order": ["openai-native"]}), encoding="utf-8"
+        )
+        prompts = run_dir / "prompts"
+        prompts.mkdir()
+        prompt = prompts / "01-card.md"
+        prompt.write_text("Create a structured 3:4 Chinese information card.", encoding="utf-8")
+        image = run_dir / "01-card.png"
+        image.write_bytes(PNG)
+        written = datetime.fromtimestamp(prompt.stat().st_mtime, tz=timezone.utc)
+        skill = ROOT / "skills" / "baoyu-xhs-images" / "SKILL.md"
+        original = pipeline / "input.md"
+        manifest = {
+            "schema_version": 3,
+            "protocol_version": "2026-07-18-001",
+            "run_id": json.loads((pipeline / "run.json").read_text())["run_id"],
+            "mode": "newspic",
+            "canonical_output_dir": str(run_dir),
+            "source": {
+                "original_path": str(original),
+                "original_sha256": sha256(original),
+                "publisher_text_sha256": sha256(original),
+            },
+            "skill_contract": {
+                "skill_name": "baoyu-xhs-images",
+                "skill_path": str(skill),
+                "skill_sha256": sha256(skill),
+                "files_read": [str(skill)],
+                "preferences": {"source": "auto", "style": "auto"},
+            },
+            "plan": {"image_count": 1, "card_count": 1},
+            "images": [{
+                "id": "01", "kind": "card", "source_skill": "baoyu-xhs-images",
+                "prompt_path": str(prompt), "prompt_sha256": sha256(prompt),
+                "prompt_written_at": written.isoformat(), "output_path": str(image),
+                "output_sha256": sha256(image), "aspect": "3:4",
+                "attempts": [{
+                    "scope": "image", "backend": "openai-native",
+                    "prompt_sha256": sha256(prompt),
+                    "started_at": (written + timedelta(seconds=1)).isoformat(),
+                    "finished_at": (written + timedelta(seconds=2)).isoformat(),
+                    "verdict": "success", "error_summary": "",
+                }],
+                "status": "success",
+            }],
+        }
+        manifest_path = pipeline / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        for status in ("rendering", "artwork_ready"):
+            moved = self.run_script(
+                "run_context.py", "status", str(run_dir), status, "--actor", "wechat-leader"
+            )
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+        built = self.run_script("build_publish_snapshot.py", str(run_dir))
+        self.assertEqual(built.returncode, 0, built.stderr)
+        ready = self.run_script(
+            "run_context.py", "status", str(run_dir), "publish_ready", "--actor", "wechat-leader"
+        )
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        return run_dir, manifest_path
 
     def test_run_context_reuses_active_matching_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -59,6 +181,35 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertFalse(first_data["reused"])
             self.assertTrue(second_data["reused"])
             self.assertEqual(first_data["run_dir"], second_data["run_dir"])
+
+    def test_run_context_does_not_reuse_a_runtime_mismatched_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("same article\n", encoding="utf-8")
+            args = (
+                "init",
+                "--mode", "newspic",
+                "--account", "xiyue",
+                "--slug", "runtime-changed",
+                "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            first = self.run_script("run_context.py", *args)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_data = json.loads(first.stdout)
+            runtime_path = Path(first_data["run_dir"]) / ".pipeline" / "runtime-integrity.json"
+            runtime_path.chmod(0o600)
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            runtime["runtime_sha256"] = "0" * 64
+            runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+            runtime_path.chmod(0o400)
+
+            second = self.run_script("run_context.py", *args)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_data = json.loads(second.stdout)
+            self.assertFalse(second_data["reused"])
+            self.assertNotEqual(first_data["run_dir"], second_data["run_dir"])
 
     def test_run_context_reads_exports_root_from_pipeline_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -123,9 +274,14 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertEqual(run_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual((run_dir / ".pipeline").stat().st_mode & 0o777, 0o700)
             self.assertEqual((run_dir / ".pipeline" / "input.md").stat().st_mode & 0o777, 0o400)
+            moved = self.run_script(
+                "run_context.py", "status", str(run_dir), "formatting",
+                "--actor", "wechat-leader",
+            )
+            self.assertEqual(moved.returncode, 0, moved.stderr)
             progress = self.run_script(
                 "run_context.py", "progress", str(run_dir),
-                "--actor", "wechat-designer", "--stage", "rendering",
+                "--actor", "wechat-formatter", "--stage", "formatting",
                 "--completed", "1", "--total", "3", "--message", "first image",
             )
             self.assertEqual(progress.returncode, 0, progress.stderr)
@@ -147,30 +303,31 @@ class PipelineScriptTests(unittest.TestCase):
             )
             run_dir = json.loads(created.stdout)["run_dir"]
             worker_write = self.run_script(
-                "run_context.py", "status", run_dir, "planning", "--actor", "wechat-designer"
+                "run_context.py", "status", run_dir, "formatting", "--actor", "wechat-designer"
             )
             self.assertNotEqual(worker_write.returncode, 0)
             self.assertIn("only be changed by actor wechat-leader", worker_write.stderr)
             invalid = self.run_script("run_context.py", "status", run_dir, "published", "--actor", "wechat-leader")
             self.assertNotEqual(invalid.returncode, 0)
             self.assertIn("invalid run status transition", invalid.stderr)
-            valid = self.run_script("run_context.py", "status", run_dir, "planning", "--actor", "wechat-leader")
+            valid = self.run_script("run_context.py", "status", run_dir, "formatting", "--actor", "wechat-leader")
             self.assertEqual(valid.returncode, 0, valid.stderr)
             failed = self.run_script("run_context.py", "status", run_dir, "failed", "--actor", "wechat-leader")
             self.assertEqual(failed.returncode, 0, failed.stderr)
-            wrong_resume = self.run_script("run_context.py", "status", run_dir, "ready", "--actor", "wechat-leader")
+            wrong_resume = self.run_script("run_context.py", "status", run_dir, "content_ready", "--actor", "wechat-leader")
             self.assertNotEqual(wrong_resume.returncode, 0)
-            resumed = self.run_script("run_context.py", "status", run_dir, "planning", "--actor", "wechat-leader")
+            resumed = self.run_script("run_context.py", "status", run_dir, "formatting", "--actor", "wechat-leader")
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             events = [
                 json.loads(line)
                 for line in (Path(run_dir) / ".pipeline" / "events.jsonl").read_text().splitlines()
             ]
             self.assertEqual(events[0]["event"], "run.created")
-            self.assertEqual(events[-1]["details"], {"from": "failed", "to": "planning"})
+            self.assertEqual(events[-1]["details"]["from"], "failed")
+            self.assertEqual(events[-1]["details"]["to"], "formatting")
             self.assertTrue(all(event["actor"] == "wechat-leader" for event in events))
 
-    def test_news_layout_status_sequence_is_supported(self) -> None:
+    def test_content_ready_gate_requires_formatted_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "source.md"
@@ -183,31 +340,32 @@ class PipelineScriptTests(unittest.TestCase):
                 "--source", str(source),
                 "--exports-root", str(root / "exports"),
             )
-            run_dir = json.loads(created.stdout)["run_dir"]
-            for status in ("planning", "rendering", "ready", "typesetting", "layout_ready", "publishing"):
-                result = self.run_script(
-                    "run_context.py", "status", run_dir, status,
-                    "--actor", "wechat-leader",
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
+            run_dir = Path(json.loads(created.stdout)["run_dir"])
+            formatting = self.run_script(
+                "run_context.py", "status", str(run_dir), "formatting", "--actor", "wechat-leader"
+            )
+            self.assertEqual(formatting.returncode, 0, formatting.stderr)
+            rejected = self.run_script(
+                "run_context.py", "status", str(run_dir), "content_ready", "--actor", "wechat-leader"
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            prepared = self.run_script(
+                "prepare_content.py", str(run_dir), "--source", str(run_dir / ".pipeline" / "input.md")
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            accepted = self.run_script(
+                "run_context.py", "status", str(run_dir), "content_ready", "--actor", "wechat-leader"
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
     def test_published_requires_a_verified_durable_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            source = root / "source.md"
-            source.write_text("article\n", encoding="utf-8")
-            created = self.run_script(
-                "run_context.py", "init", "--mode", "newspic", "--account", "xiyue",
-                "--slug", "receipt", "--source", str(source),
-                "--exports-root", str(root / "exports"),
+            run_dir, _ = self.make_v2_newspic_run(root)
+            publishing = self.run_script(
+                "run_context.py", "status", str(run_dir), "publishing", "--actor", "wechat-leader"
             )
-            run_dir = Path(json.loads(created.stdout)["run_dir"])
-            for status in ("planning", "rendering", "ready", "publishing"):
-                result = self.run_script(
-                    "run_context.py", "status", str(run_dir), status,
-                    "--actor", "wechat-leader",
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(publishing.returncode, 0, publishing.stderr)
             rejected = self.run_script(
                 "run_context.py", "status", str(run_dir), "published",
                 "--actor", "wechat-leader",
@@ -215,29 +373,54 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("publish-result.json", rejected.stderr)
 
+    def test_direct_run_state_edit_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("# Article\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init", "--mode", "newspic", "--account", "xiyue",
+                "--slug", "tamper", "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            run_dir = Path(json.loads(created.stdout)["run_dir"])
+            run_path = run_dir / ".pipeline" / "run.json"
+            run = json.loads(run_path.read_text(encoding="utf-8"))
+            run["status"] = "rendering"
+            run_path.write_text(json.dumps(run), encoding="utf-8")
+            result = self.run_script(
+                "run_context.py", "status", str(run_dir), "artwork_ready", "--actor", "wechat-leader"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("state checksum mismatch", result.stderr)
+
     def test_publish_result_validator_accepts_verified_matching_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            manifest_path = self.make_run(root, status="success")
-            run_dir = manifest_path.parent.parent
-            run_path = run_dir / ".pipeline" / "run.json"
-            run = json.loads(run_path.read_text())
-            run["status"] = "publishing"
-            run_path.write_text(json.dumps(run), encoding="utf-8")
+            run_dir, manifest_path = self.make_v2_newspic_run(root)
+            publishing = self.run_script(
+                "run_context.py", "status", str(run_dir), "publishing", "--actor", "wechat-leader"
+            )
+            self.assertEqual(publishing.returncode, 0, publishing.stderr)
+            run = json.loads((run_dir / ".pipeline" / "run.json").read_text())
             manifest = json.loads(manifest_path.read_text())
             image_path = Path(manifest["images"][0]["output_path"]).resolve()
             source_path = Path(manifest["source"]["original_path"]).resolve()
+            snapshot_path = run_dir / ".pipeline" / "publish-snapshot.json"
+            snapshot = json.loads(snapshot_path.read_text())
             (run_dir / ".pipeline" / "publish-result.json").write_text(
                 json.dumps({
                     "schema_version": 1,
                     "ok": True,
-                    "protocol_version": "2026-07-13-001",
+                    "protocol_version": "2026-07-18-001",
                     "run_id": run["run_id"],
                     "mode": "newspic",
                     "account": "xiyue",
                     "publish_fingerprint": "f" * 64,
                     "draft_media_id": "draft-1",
                     "creation_status": "created",
+                    "snapshot_sha256": sha256(snapshot_path),
+                    "snapshot_fingerprint": snapshot["fingerprint"],
                     "manifest_sha256": sha256(manifest_path),
                     "source_sha256": sha256(source_path),
                     "images": [{"path": str(image_path), "sha256": sha256(image_path)}],
@@ -266,12 +449,12 @@ class PipelineScriptTests(unittest.TestCase):
                 "--exports-root", str(root / "exports"),
             )
             run_dir = json.loads(created.stdout)["run_dir"]
-            planning = self.run_script(
-                "run_context.py", "status", run_dir, "planning", "--actor", "wechat-leader"
+            formatting = self.run_script(
+                "run_context.py", "status", run_dir, "formatting", "--actor", "wechat-leader"
             )
-            self.assertEqual(planning.returncode, 0, planning.stderr)
+            self.assertEqual(formatting.returncode, 0, formatting.stderr)
             skipped_render = self.run_script(
-                "run_context.py", "status", run_dir, "ready", "--actor", "wechat-leader"
+                "run_context.py", "status", run_dir, "planning", "--actor", "wechat-leader"
             )
             self.assertNotEqual(skipped_render.returncode, 0)
 
@@ -285,7 +468,7 @@ class PipelineScriptTests(unittest.TestCase):
             run_path.write_text(json.dumps(run), encoding="utf-8")
             receipt = {
                 "schema_version": 1,
-                "protocol_version": "2026-07-13-001",
+                "protocol_version": "2026-07-18-001",
                 "run_id": run["run_id"],
                 "mode": "newspic",
                 "account": "xiyue",
@@ -303,14 +486,14 @@ class PipelineScriptTests(unittest.TestCase):
 
     def test_newspic_dry_run_is_bound_to_manifest_text_and_images(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            manifest_path = self.make_run(Path(temp), status="success")
-            run_dir = manifest_path.parent.parent
+            run_dir, manifest_path = self.make_v2_newspic_run(Path(temp))
             result = subprocess.run(
                 [
                     PYTHON,
                     str(ROOT / "skills" / "wechat-publisher" / "scripts" / "publish.py"),
                     "newspic",
                     "--manifest", str(manifest_path),
+                    "--snapshot", str(run_dir / ".pipeline" / "publish-snapshot.json"),
                     "--account", "xiyue",
                     "--result-output", str(run_dir / ".pipeline" / "publish-result.json"),
                     "--verify-draft",
@@ -323,78 +506,26 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             payload = json.loads(result.stdout)
             manifest = json.loads(manifest_path.read_text())
-            self.assertEqual(payload["draft"]["title"], "article")
+            self.assertEqual(payload["draft"]["title"], "Article")
             self.assertEqual(
                 payload["draft"]["images"],
                 [str(Path(manifest["images"][0]["output_path"]).resolve())],
             )
 
-    def test_article_source_is_created_once_and_reused_after_designer_edits(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source = root / "source.md"
-            source.write_text("# Article\n\nBody.\n", encoding="utf-8")
-            created = self.run_script(
-                "run_context.py", "init",
-                "--mode", "news",
-                "--account", "xiyue",
-                "--slug", "article-source",
-                "--source", str(source),
-                "--exports-root", str(root / "exports"),
-            )
-            run_dir = Path(json.loads(created.stdout)["run_dir"])
-            sealed = run_dir / ".pipeline" / "input.md"
-            prepared = self.run_script(
-                "prepare_article_source.py", str(run_dir), "--source", str(sealed)
-            )
-            self.assertEqual(prepared.returncode, 0, prepared.stderr)
-            payload = json.loads(prepared.stdout)
-            article_source = Path(payload["article_source_path"])
-            self.assertFalse(payload["reused"])
-            self.assertEqual(article_source.read_bytes(), sealed.read_bytes())
-            self.assertTrue(article_source.stat().st_mode & 0o200)
-
-            article_source.write_text(article_source.read_text() + "\n![](imgs/01.png)\n", encoding="utf-8")
-            resumed = self.run_script(
-                "prepare_article_source.py", str(run_dir), "--source", str(sealed)
-            )
-            self.assertEqual(resumed.returncode, 0, resumed.stderr)
-            self.assertTrue(json.loads(resumed.stdout)["reused"])
-            self.assertIn("imgs/01.png", article_source.read_text(encoding="utf-8"))
-
-    def test_article_source_rejects_input_outside_run(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source = root / "source.md"
-            source.write_text("article\n", encoding="utf-8")
-            created = self.run_script(
-                "run_context.py", "init",
-                "--mode", "news",
-                "--account", "xiyue",
-                "--slug", "article-source-boundary",
-                "--source", str(source),
-                "--exports-root", str(root / "exports"),
-            )
-            run_dir = json.loads(created.stdout)["run_dir"]
-            result = self.run_script(
-                "prepare_article_source.py", run_dir, "--source", str(source)
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("inside canonical_output_dir", result.stderr)
-
     def test_seal_rejects_mismatched_run_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            source = root / "source.md"
+            source.write_text("# Article\n", encoding="utf-8")
             created = self.run_script(
                 "run_context.py", "init",
                 "--mode", "newspic",
                 "--account", "xiyue",
                 "--slug", "seal-test",
+                "--source", str(source),
                 "--exports-root", str(root / "exports"),
             )
             run_dir = Path(json.loads(created.stdout)["run_dir"])
-            input_path = run_dir / ".pipeline" / "input.md"
-            input_path.write_text("article\n", encoding="utf-8")
             run_path = run_dir / ".pipeline" / "run.json"
             run = json.loads(run_path.read_text(encoding="utf-8"))
             run["canonical_output_dir"] = str(root / "wrong-run")
@@ -420,7 +551,7 @@ class PipelineScriptTests(unittest.TestCase):
             )
             run_dir = json.loads(created.stdout)["run_dir"]
             planning = self.run_script(
-                "run_context.py", "status", run_dir, "planning",
+                "run_context.py", "status", run_dir, "formatting",
                 "--actor", "wechat-leader",
             )
             self.assertEqual(planning.returncode, 0, planning.stderr)
@@ -428,15 +559,18 @@ class PipelineScriptTests(unittest.TestCase):
                 "run_context.py", "seal", run_dir, "--actor", "wechat-leader"
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("cannot seal run while status is 'planning'", result.stderr)
+            self.assertIn("cannot seal run while status is 'formatting'", result.stderr)
 
     def test_slug_error_reports_the_original_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.md"
+            source.write_text("# Article\n", encoding="utf-8")
             result = self.run_script(
                 "run_context.py", "init",
                 "--mode", "newspic",
                 "--account", "xiyue",
                 "--slug", "周报",
+                "--source", str(source),
                 "--exports-root", str(Path(temp) / "exports"),
             )
         self.assertNotEqual(result.returncode, 0)
@@ -476,14 +610,14 @@ class PipelineScriptTests(unittest.TestCase):
         started = written - timedelta(seconds=5) if attempt_before_prompt else written + timedelta(seconds=1)
         finished = started + timedelta(seconds=1)
         run = {
-            "protocol_version": "2026-07-13-001",
+            "protocol_version": "2026-07-18-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "account": "xiyue",
             "canonical_output_dir": str(run_dir),
             "input_path": str(input_path),
             "source_sha256": sha256(input_path),
-            "status": "ready",
+            "status": "artwork_ready",
         }
         (pipeline / "run.json").write_text(json.dumps(run), encoding="utf-8")
         (pipeline / "preflight.json").write_text(
@@ -491,8 +625,8 @@ class PipelineScriptTests(unittest.TestCase):
         )
         verdict = "success" if status == "success" else "api_error"
         manifest = {
-            "schema_version": 2,
-            "protocol_version": "2026-07-13-001",
+            "schema_version": 3,
+            "protocol_version": "2026-07-18-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "canonical_output_dir": str(run_dir),
@@ -513,6 +647,7 @@ class PipelineScriptTests(unittest.TestCase):
                     "extend_sha256": sha256(extend_path),
                 },
             },
+            "plan": {"image_count": 1, "card_count": 1},
             "images": [{
                 "id": "01",
                 "kind": "card",
@@ -547,6 +682,21 @@ class PipelineScriptTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1)
             self.assertIn("not publish-ready", result.stdout)
+
+    def test_placeholder_backend_is_rejected_even_if_preflight_lists_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["images"][0]["attempts"][0]["backend"] = "placeholder"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (manifest_path.parent / "preflight.json").write_text(
+                json.dumps({"fallback_order": ["placeholder"]}), encoding="utf-8"
+            )
+            result = self.run_script(
+                "validate_designer_manifest.py", str(manifest_path), "--phase", "publish-ready"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("placeholder is never publishable", result.stdout)
 
     def test_attempt_cannot_predate_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -728,10 +878,7 @@ class PipelineScriptTests(unittest.TestCase):
             manifest_path = self.make_run(Path(temp), status="success")
             manifest = json.loads(manifest_path.read_text())
             image_path = Path(manifest["images"][0]["output_path"])
-            wrong = (
-                b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
-                + struct.pack(">II", 400, 300) + b"\x08\x06\x00\x00\x00payload"
-            )
+            wrong = fake_png(400, 300)
             image_path.write_bytes(wrong)
             manifest["images"][0]["output_sha256"] = sha256(image_path)
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -740,6 +887,37 @@ class PipelineScriptTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("do not match aspect", result.stdout)
+
+    def test_publish_ready_rejects_forged_png_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            manifest = json.loads(manifest_path.read_text())
+            image_path = Path(manifest["images"][0]["output_path"])
+            image_path.write_bytes(
+                b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
+                + struct.pack(">II", 900, 1200) + b"\x08\x02\x00\x00\x00" + b"x" * 5000
+            )
+            manifest["images"][0]["output_sha256"] = sha256(image_path)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = self.run_script(
+                "validate_designer_manifest.py", str(manifest_path), "--phase", "publish-ready"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("invalid output PNG", result.stdout)
+
+    def test_publish_ready_rejects_single_color_blank_png(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            manifest = json.loads(manifest_path.read_text())
+            image_path = Path(manifest["images"][0]["output_path"])
+            image_path.write_bytes(solid_png(900, 1200))
+            manifest["images"][0]["output_sha256"] = sha256(image_path)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = self.run_script(
+                "validate_designer_manifest.py", str(manifest_path), "--phase", "publish-ready"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("single-color blank image", result.stdout)
 
     def test_publish_ready_rejects_publisher_text_hash_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -770,6 +948,188 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("prompt_path must stay inside canonical_output_dir", result.stdout)
 
+    def test_news_v2_offline_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.md"
+            source.write_text("# Title\n\n## Section\n\nBody.\n", encoding="utf-8")
+            created = self.run_script(
+                "run_context.py", "init", "--mode", "news", "--account", "xiyue",
+                "--slug", "v2-news", "--source", str(source),
+                "--exports-root", str(root / "exports"),
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            run_dir = Path(json.loads(created.stdout)["run_dir"])
+            pipeline = run_dir / ".pipeline"
+            for status in ("formatting",):
+                result = self.run_script(
+                    "run_context.py", "status", str(run_dir), status, "--actor", "wechat-leader"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            prepared = self.run_script(
+                "prepare_content.py", str(run_dir), "--source", str(pipeline / "input.md")
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            for status in ("content_ready", "planning"):
+                result = self.run_script(
+                    "run_context.py", "status", str(run_dir), status, "--actor", "wechat-leader"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            (pipeline / "preflight.json").write_text(
+                json.dumps({"fallback_order": ["openai-native"]}), encoding="utf-8"
+            )
+            prompts = run_dir / "prompts"
+            prompts.mkdir()
+            cover_prompt = prompts / "00-cover.md"
+            body_prompt = prompts / "01-body.md"
+            cover_prompt.write_text("2.35:1 editorial cover without text", encoding="utf-8")
+            body_prompt.write_text("16:9 editorial illustration without text", encoding="utf-8")
+            cover = run_dir / "00-cover.png"
+            body = run_dir / "01-body.png"
+            cover.write_bytes(fake_png(1880, 800))
+            body.write_bytes(fake_png(1600, 900))
+            skill = ROOT / "skills" / "baoyu-cover-image" / "SKILL.md"
+            article_skill = ROOT / "skills" / "baoyu-article-illustrator" / "SKILL.md"
+            run = json.loads((pipeline / "run.json").read_text(encoding="utf-8"))
+            original = pipeline / "input.md"
+
+            def image_record(
+                image_id: str, kind: str, source_skill: str, prompt: Path,
+                output: Path, aspect: str,
+            ) -> dict:
+                written = datetime.fromtimestamp(prompt.stat().st_mtime, tz=timezone.utc)
+                return {
+                    "id": image_id, "kind": kind, "source_skill": source_skill,
+                    "prompt_path": str(prompt), "prompt_sha256": sha256(prompt),
+                    "prompt_written_at": written.isoformat(), "output_path": str(output),
+                    "output_sha256": sha256(output), "aspect": aspect,
+                    "attempts": [{
+                        "scope": "image", "backend": "openai-native",
+                        "prompt_sha256": sha256(prompt),
+                        "started_at": (written + timedelta(seconds=1)).isoformat(),
+                        "finished_at": (written + timedelta(seconds=2)).isoformat(),
+                        "verdict": "success", "error_summary": "",
+                    }],
+                    "status": "success",
+                }
+
+            manifest = {
+                "schema_version": 3,
+                "protocol_version": "2026-07-18-001",
+                "run_id": run["run_id"], "mode": "news",
+                "canonical_output_dir": str(run_dir),
+                "source": {
+                    "original_path": str(original), "original_sha256": sha256(original),
+                    "publisher_text_sha256": sha256(original),
+                },
+                "skill_contract": {
+                    "skill_name": "baoyu-cover-image", "skill_path": str(skill),
+                    "skill_sha256": sha256(skill), "files_read": [str(skill), str(article_skill)],
+                    "preferences": {"source": "auto", "style": "auto"},
+                },
+                "plan": {"image_count": 2, "cover_count": 1, "body_count": 1},
+                "images": [
+                    image_record("00", "cover", "baoyu-cover-image", cover_prompt, cover, "2.35:1"),
+                    image_record("01", "inline", "baoyu-article-illustrator", body_prompt, body, "16:9"),
+                ],
+            }
+            manifest_path = pipeline / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            for status in ("rendering", "artwork_ready", "typesetting"):
+                result = self.run_script(
+                    "run_context.py", "status", str(run_dir), status, "--actor", "wechat-leader"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            html = run_dir / "article-body.html"
+            html.write_text(
+                '<section><h2><span leaf="">Section</span></h2>'
+                '<p><span leaf="">Body.</span></p>'
+                f'<img src="{body}"></section>',
+                encoding="utf-8",
+            )
+            gzh = ROOT / "skills" / "gzh-design"
+            lock = json.loads((ROOT / "third_party" / "gzh-design.lock.json").read_text())
+            layout = {
+                "schema_version": 1, "protocol_version": "2026-07-18-001",
+                "run_id": run["run_id"], "mode": "news", "canonical_output_dir": str(run_dir),
+                "source": {
+                    "markdown_path": str(run_dir / "content.md"),
+                    "markdown_sha256": sha256(run_dir / "content.md"),
+                    "original_path": str(original), "original_sha256": sha256(original),
+                },
+                "skill_contract": {
+                    "skill_name": "gzh-design", "skill_path": str(gzh / "SKILL.md"),
+                    "skill_sha256": sha256(gzh / "SKILL.md"), "tree_sha256": lock["tree_sha256"],
+                    "files_read": [
+                        str(gzh / "SKILL.md"), str(gzh / "references" / "theme-index.md"),
+                        str(gzh / "references" / "theme-moyu-green.md"),
+                        str(gzh / "references" / "common-components.md"),
+                    ],
+                    "upstream_commit": lock["commit"],
+                },
+                "decision": {
+                    "theme": "摸鱼绿", "theme_source": "auto",
+                    "article_type": "观点/深度分析", "content_policy": "preserve-visible-text",
+                },
+                "metadata": {
+                    "title": "Title", "author": "", "summary": "Body.",
+                    "cover_path": str(cover),
+                },
+                "output": {
+                    "html_path": str(html), "html_sha256": sha256(html),
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+            layout_path = pipeline / "layout.json"
+            layout_path.write_text(json.dumps(layout), encoding="utf-8")
+            layout_check = self.run_script(
+                "validate_article_layout.py", str(html), "--manifest", str(layout_path),
+                "--output", str(pipeline / "layout-validation.json"),
+            )
+            self.assertEqual(layout_check.returncode, 0, layout_check.stdout + layout_check.stderr)
+            layout_ready = self.run_script(
+                "run_context.py", "status", str(run_dir), "layout_ready", "--actor", "wechat-leader"
+            )
+            self.assertEqual(layout_ready.returncode, 0, layout_ready.stderr)
+            built = self.run_script("build_publish_snapshot.py", str(run_dir))
+            self.assertEqual(built.returncode, 0, built.stderr)
+            for status in ("publish_ready", "publishing"):
+                result = self.run_script(
+                    "run_context.py", "status", str(run_dir), status, "--actor", "wechat-leader"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            snapshot_path = pipeline / "publish-snapshot.json"
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            receipt = {
+                "schema_version": 1, "protocol_version": "2026-07-18-001",
+                "run_id": run["run_id"], "ok": True, "mode": "article-html", "account": "xiyue",
+                "publish_fingerprint": "f" * 64, "draft_media_id": "draft-news",
+                "creation_status": "created", "snapshot_sha256": sha256(snapshot_path),
+                "snapshot_fingerprint": snapshot["fingerprint"],
+                "layout_sha256": sha256(layout_path), "html_sha256": sha256(html),
+                "body_image_count": 1, "uploaded_body_image_count": 1,
+                "uploaded_body_images": {str(body): "https://mmbiz.qpic.cn/body"},
+                "cover_path": str(cover),
+                "verification": {
+                    "ok": True, "status": "verified", "method": "draft/get",
+                    "verified_at": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+            (pipeline / "publish-result.json").write_text(json.dumps(receipt), encoding="utf-8")
+            validated = self.run_script("validate_publish_result.py", str(run_dir))
+            self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
+            published = self.run_script(
+                "run_context.py", "status", str(run_dir), "published", "--actor", "wechat-leader"
+            )
+            self.assertEqual(published.returncode, 0, published.stderr)
+            self.assertEqual(
+                json.loads((pipeline / "run.json").read_text(encoding="utf-8"))["status"],
+                "published",
+            )
+
     def make_layout(self, root: Path, *, placeholder: bool = False) -> tuple[Path, Path]:
         source = root / "source.md"
         source.write_text("# 标题\n\n正文。\n", encoding="utf-8")
@@ -784,23 +1144,35 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertEqual(created.returncode, 0, created.stderr)
         run = json.loads(created.stdout)
         run_dir = Path(run["run_dir"])
+        cover = run_dir / "cover.png"
+        cover.write_bytes(PNG)
+        body = run_dir / "body.png"
+        body.write_bytes(PNG)
         html_path = run_dir / "article-body.html"
         visible = "{{作者名}}" if placeholder else "正文。"
         html_path.write_text(
-            f'<section><p><span leaf="">{visible}</span></p></section>', encoding="utf-8"
+            f'<section><p><span leaf="">{visible}</span></p>'
+            f'<img src="{body}"></section>', encoding="utf-8"
         )
-        cover = run_dir / "cover.png"
-        cover.write_bytes(PNG)
         gzh = ROOT / "skills" / "gzh-design"
         lock = json.loads(
             (ROOT / "third_party" / "gzh-design.lock.json").read_text(encoding="utf-8")
         )
         original = run_dir / ".pipeline" / "input.md"
-        markdown = run_dir / "article-source.md"
+        markdown = run_dir / "content.md"
         markdown.write_bytes(original.read_bytes())
+        (run_dir / ".pipeline" / "manifest.json").write_text(
+            json.dumps({
+                "images": [
+                    {"id": "00", "kind": "cover", "output_path": str(cover)},
+                    {"id": "01", "kind": "inline", "output_path": str(body)},
+                ]
+            }),
+            encoding="utf-8",
+        )
         layout = {
             "schema_version": 1,
-            "protocol_version": "2026-07-13-001",
+            "protocol_version": "2026-07-18-001",
             "run_id": run["run_id"],
             "mode": "news",
             "canonical_output_dir": str(run_dir),

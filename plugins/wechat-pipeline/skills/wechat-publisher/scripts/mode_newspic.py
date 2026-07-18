@@ -33,6 +33,7 @@ from lib.result_store import (
     write_receipt,
 )
 from lib.source_loader import load_source, validate_newspic_source
+from lib.pipeline_snapshot import load_pipeline_snapshot
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 PLUGIN_ROOT = SKILL_DIR.parent.parent
@@ -77,25 +78,34 @@ def _load_pipeline_manifest(args, result_path: Path | None) -> tuple[dict, Path,
         raise PublishError(f"pipeline manifest must be {expected_manifest}")
     if result_path != expected_result:
         raise PublishError(f"pipeline newspic publishing requires {expected_result}")
+    snapshot = load_pipeline_snapshot(getattr(args, "snapshot", None), canonical, "newspic")
     if args.source or args.content is not None or args.image:
         raise PublishError("--manifest cannot be combined with source, --content, or --image")
     source_path = Path(str(manifest["source"]["original_path"])).expanduser().resolve()
     sealed_text = source_path.read_text(encoding="utf-8").strip()
-    title = _derive_title(sealed_text)
+    publication = snapshot["data"].get("publication") or {}
+    title = str(publication.get("title") or "").strip()
+    if not title:
+        raise PublishError("publish snapshot is missing newspic publication.title")
     if args.title is not None and args.title.strip() != title:
-        raise PublishError("--title does not match the title derived from sealed pipeline input")
+        raise PublishError("--title does not match publish snapshot")
+    if args.author is not None and args.author.strip() != str(publication.get("author") or ""):
+        raise PublishError("--author does not match publish snapshot")
+    if args.digest is not None and args.digest.strip() != str(publication.get("digest") or ""):
+        raise PublishError("--digest does not match publish snapshot")
     images = [str(Path(str(item["output_path"])).expanduser().resolve()) for item in manifest["images"]]
     source = {
         "title": title,
         "content": sealed_text,
-        "author": args.author or "",
-        "digest": args.digest or "",
+        "author": publication.get("author") or "",
+        "digest": publication.get("digest") or "",
         "images": images,
     }
     return source, canonical, {
         "path": manifest_path,
         "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "snapshot": snapshot,
     }
 
 
@@ -155,6 +165,8 @@ def _run(args) -> int:
 
     env, used_env = merged_env(base_dir, args.env_file, SKILL_DIR)
     account = resolve_account(args.account, source, env)
+    if manifest_binding and manifest_binding["snapshot"]["account"] != account:
+        raise PublishError("selected account does not match publish snapshot")
     title, content, author, digest, images = validate_newspic_source(source, base_dir)
     api_base = env.get("WECHAT_API_BASE") or DEFAULT_API_BASE
     proxy_url = env.get("WECHAT_PROXY_URL", "")
@@ -171,6 +183,8 @@ def _run(args) -> int:
         "images": [{"path": str(path), "sha256": sha256_file(path)} for path in images],
         "manifest_sha256": manifest_binding["sha256"] if manifest_binding else None,
         "source_sha256": manifest_binding["source_sha256"] if manifest_binding else None,
+        "snapshot_sha256": manifest_binding["snapshot"]["sha256"] if manifest_binding else None,
+        "snapshot_fingerprint": manifest_binding["snapshot"]["fingerprint"] if manifest_binding else None,
         "run_identity": run_identity(result_path),
     })
 
@@ -245,6 +259,8 @@ def _run(args) -> int:
     binding_fields = {
         "manifest_sha256": manifest_binding["sha256"] if manifest_binding else None,
         "source_sha256": manifest_binding["source_sha256"] if manifest_binding else None,
+        "snapshot_sha256": manifest_binding["snapshot"]["sha256"] if manifest_binding else None,
+        "snapshot_fingerprint": manifest_binding["snapshot"]["fingerprint"] if manifest_binding else None,
         "images": [{"path": str(path), "sha256": sha256_file(path)} for path in images],
     }
     media_ids: list[str] = list((checkpoint or {}).get("uploaded_image_media_ids") or [])

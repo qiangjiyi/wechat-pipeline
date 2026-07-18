@@ -15,7 +15,7 @@
 ### 决策
 
 1. 把固定上游 commit 的 gzh-design 运行快照原样纳入 Plugin，不修改其 `SKILL.md`、references、scripts 或 assets。
-2. Formatter 后创建一次可写的 `article-source.md`；Baoyu article-illustrator 在该副本中原生插入图片引用，不接触只读 sealed 原稿。
+2. Formatter 后创建只读 `content.md`；Designer 和 Typesetter 共同读取它，不允许再向正文插入或改名图片引用。
 3. 新增独立 Typesetter worker，在 Designer 与 Publisher 之间原生执行 gzh-design。
 4. News Publisher 默认消费已验收的 `article-body.html`，不再在发布阶段二次渲染 Markdown。
 5. Publisher 只上传正文图片并替换 `img[src]`，保留 Typesetter 生成的其余 HTML。
@@ -57,3 +57,27 @@
 - `draft/add` 不具备幂等语义，禁止网络自动重试；不确定结果写入 `creation_status: unknown` 并阻止自动重建。
 - Newspic 发布从 manifest 读取 sealed 原文和有序图片，发布回执保存上游 hash 与上传素材 ID。
 - 状态机按模式隔离，回读验收必须明确记录 `draft/get`、`verified` 和验证时间。
+
+## ADR-003：控制面与内容面分离，只保留单阶段图片并行
+
+- 状态：已采纳
+- 日期：2026-07-18
+- 适用版本：wechat-pipeline 0.5.0 / protocol 2026-07-18-001
+
+### 背景
+
+跨阶段提前排版和并发验证在没有 revision、锁和不可变快照时造成 manifest 覆盖、状态提前、别名图片和失败后继续发布。Agent 还可以修改 validator 或 trust lock 来让自身产物通过。
+
+### 决策
+
+1. 状态、门禁、运行时完整性和发布快照全部由确定性脚本控制。
+2. Formatter、Designer、Typesetter、Publisher 只写各自拥有的内容产物。
+3. `content.md` 与 `publish-snapshot.json` 创建后只读。
+4. Typesetter 必须等待全部图片通过 artwork gate。
+5. 唯一允许的并行是同一 Designer 对不同图片进行 batch 调用；共享 manifest 最后单次汇总。
+6. Publisher 必须验证 snapshot，发布回执必须绑定 snapshot hash 和 fingerprint。
+7. `run.json` 增加 revision 与 state checksum，拒绝直接状态编辑。
+
+### 结果
+
+牺牲约 1–2 分钟的跨阶段重叠，换取可重放、可恢复且不可通过普通 Agent 操作绕过的发布链路。主要性能收益来自图片 batch，而不是让多个 Agent 同时写共享文件。

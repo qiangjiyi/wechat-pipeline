@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+from urllib.parse import unquote, urlparse
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -60,9 +61,16 @@ class VisibleText(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        self.images: list[str] = []
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "img":
+            source = dict(attrs).get("src")
+            if source:
+                self.images.append(source)
 
 
 def normalize_visible_text(value: str) -> str:
@@ -161,9 +169,9 @@ def validate_manifest(manifest_path: Path, html_path: Path, errors: list[str]) -
 
     source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
     markdown_path = Path(str(source.get("markdown_path", ""))).expanduser().resolve()
-    expected_markdown = canonical / "article-source.md"
+    expected_markdown = canonical / "content.md"
     if markdown_path != expected_markdown:
-        errors.append("layout source.markdown_path must be <canonical_output_dir>/article-source.md")
+        errors.append("layout source.markdown_path must be <canonical_output_dir>/content.md")
     elif not markdown_path.is_file():
         errors.append(f"layout source markdown not found: {markdown_path}")
     elif sha256_file(markdown_path) != source.get("markdown_sha256"):
@@ -217,6 +225,33 @@ def validate_manifest(manifest_path: Path, html_path: Path, errors: list[str]) -
         cover_path = Path(str(cover_value)).expanduser().resolve()
         if not inside(cover_path, canonical) or not cover_path.is_file():
             errors.append("layout metadata.cover_path must be an existing file inside canonical_output_dir")
+
+    designer_path = canonical / ".pipeline" / "manifest.json"
+    try:
+        designer = json.loads(designer_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        errors.append(f"unable to read designer manifest for layout binding: {err}")
+    else:
+        images = [image for image in designer.get("images", []) if isinstance(image, dict)]
+        covers = [Path(str(image.get("output_path", ""))).expanduser().resolve() for image in images if image.get("kind") == "cover"]
+        bodies = [Path(str(image.get("output_path", ""))).expanduser().resolve() for image in images if image.get("kind") != "cover"]
+        if len(covers) != 1 or not cover_value or Path(str(cover_value)).expanduser().resolve() != covers[0]:
+            errors.append("layout cover_path must exactly match the designer manifest cover output")
+        parser = VisibleText()
+        parser.feed(html_path.read_text(encoding="utf-8", errors="replace"))
+        actual_images: list[Path] = []
+        for value in parser.images:
+            parsed = urlparse(value)
+            if parsed.scheme or parsed.netloc:
+                errors.append(f"pre-publish HTML image must be a local absolute path: {value}")
+                continue
+            path = Path(unquote(parsed.path)).expanduser()
+            if not path.is_absolute():
+                errors.append(f"pre-publish HTML image path must be absolute: {value}")
+                continue
+            actual_images.append(path.resolve())
+        if actual_images != bodies:
+            errors.append("HTML body image paths and order must exactly match designer manifest outputs")
 
     output = manifest.get("output") if isinstance(manifest.get("output"), dict) else {}
     output_path = Path(str(output.get("html_path", ""))).expanduser().resolve()

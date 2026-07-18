@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0
+
+- 协议升级到 `2026-07-18-001`，按第一性原理重构为确定性控制面与 Agent 内容面。
+- 正常 run 强制携带 source，新增 `content.md`、格式化保真门禁和运行时完整性快照。
+- 状态转换自动执行门禁，`run.json` 增加 revision 与 checksum，拒绝直接状态编辑。
+- 图片 manifest 增加强制模式契约、完整 PNG chunk/CRC/像素流、纯色空白图、最小尺寸/文件体积、真实 prompt 时间和 placeholder 拒绝。
+- 移除提前排版及跨阶段并发，只保留 Designer 内部独立图片 batch 并行。
+- 新增不可变 publish snapshot；Publisher 与最终回执强绑定 snapshot hash/fingerprint。
+- HTML 封面和正文图必须与 designer manifest 精确一致，拒绝别名副本和未登记图片。
+- 微信 `draft/get` 回读同时支持 `src` 与 `data-src` 图片。
+- 新增 newspic/news 离线完整流程、状态篡改和伪造 backend 测试。
+
 ## 0.4.0
 
 - 新增 `load_extend.py` 确定性解析 EXTEND.md（project / XDG / user-home 三级，外加 legacy `baoyu-imagine`），替代交给 LLM 不可靠的三级路径查找；Designer 直接读取解析结果。非交互模式下 EXTEND.md 未命中不再记为 `contract_error`，回退 Skill 内置默认值（`preferences.source=auto`，不记 `extend_path`）并继续生成。

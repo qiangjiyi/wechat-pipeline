@@ -37,10 +37,13 @@ def default_exports_root() -> Path:
     return Path(configured or "~/Workspace/exports").expanduser()
 
 COMMON_STATUS_TRANSITIONS = {
-    "awaiting_input": {"input_sealed", "failed", "cancelled"},
-    "input_sealed": {"planning", "failed", "cancelled"},
+    "awaiting_input": {"input_sealed", "failed", "cancelled"},  # legacy recovery only
+    "input_sealed": {"formatting", "failed", "cancelled"},
+    "formatting": {"content_ready", "failed", "cancelled"},
+    "content_ready": {"planning", "failed", "cancelled"},
     "planning": {"rendering", "failed", "cancelled"},
-    "rendering": {"ready", "failed", "cancelled"},
+    "rendering": {"artwork_ready", "failed", "cancelled"},
+    "publish_ready": {"publishing", "failed", "cancelled"},
     "publishing": {"published", "failed", "cancelled"},
     "failed": set(),
     "published": set(),
@@ -50,13 +53,13 @@ COMMON_STATUS_TRANSITIONS = {
 MODE_STATUS_TRANSITIONS = {
     "newspic": {
         **COMMON_STATUS_TRANSITIONS,
-        "ready": {"publishing", "failed", "cancelled"},
+        "artwork_ready": {"publish_ready", "failed", "cancelled"},
     },
     "news": {
         **COMMON_STATUS_TRANSITIONS,
-        "ready": {"typesetting", "failed", "cancelled"},
+        "artwork_ready": {"typesetting", "failed", "cancelled"},
         "typesetting": {"layout_ready", "failed", "cancelled"},
-        "layout_ready": {"publishing", "failed", "cancelled"},
+        "layout_ready": {"publish_ready", "failed", "cancelled"},
     },
 }
 
@@ -67,6 +70,18 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def state_checksum(data: dict) -> str:
+    protected = {
+        key: data.get(key)
+        for key in (
+            "protocol_version", "run_id", "mode", "account", "canonical_output_dir",
+            "input_path", "source_sha256", "status", "failed_from", "revision",
+        )
+    }
+    encoded = json.dumps(protected, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def slugify(value: str) -> str:
@@ -147,6 +162,21 @@ def init_lock(exports_root: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def run_lock(run_dir: Path):
+    """Serialize state projection updates for one run."""
+    if fcntl is None:
+        raise SystemExit("run state locking requires a Unix-like host")
+    lock_path = run_dir / ".pipeline" / "run.lock"
+    with lock_path.open("a+") as handle:
+        lock_path.chmod(0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def validate_run_identity(run_dir: Path, data: dict) -> Path:
     expected_dir = Path(str(data.get("canonical_output_dir", ""))).expanduser().resolve()
     if expected_dir != run_dir:
@@ -156,6 +186,8 @@ def validate_run_identity(run_dir: Path, data: dict) -> Path:
         raise SystemExit("run.json run_id does not match the requested run directory")
     if data.get("protocol_version") != PROTOCOL_VERSION:
         raise SystemExit(f"run protocol_version must be {PROTOCOL_VERSION}")
+    if data.get("state_checksum") != state_checksum(data):
+        raise SystemExit("run.json state checksum mismatch; direct state edits are forbidden")
     input_path = Path(str(data.get("input_path", ""))).expanduser().resolve()
     expected_input = run_dir / ".pipeline" / "input.md"
     if input_path != expected_input:
@@ -179,24 +211,32 @@ def find_reusable_run(
 ) -> Path | None:
     if not source_sha256:
         return None
+    from runtime_integrity import validate as validate_runtime
+
     candidates: list[tuple[str, Path]] = []
     for path, data in iter_runs(exports_root):
         if (
-            data.get("mode") == mode
+            data.get("protocol_version") == PROTOCOL_VERSION
+            and data.get("mode") == mode
             and data.get("account") == account
             and data.get("source_sha256") == source_sha256
             and data.get("status") not in {"published", "cancelled"}
         ):
-            candidates.append((str(data.get("created_at", "")), path.parent.parent))
+            run_dir = path.parent.parent
+            errors, _ = validate_runtime(run_dir, data)
+            if not errors:
+                candidates.append((str(data.get("created_at", "")), run_dir))
     return max(candidates, default=("", None))[1]
 
 
 def init_run(args: argparse.Namespace) -> int:
     exports_root = args.exports_root.expanduser().resolve()
-    source = args.source.expanduser().resolve() if args.source else None
-    if source and not source.is_file():
+    source = args.source.expanduser().resolve()
+    if not source.is_file():
         raise SystemExit(f"source file not found: {source}")
-    source_hash = sha256_file(source) if source else None
+    if source.stat().st_size == 0:
+        raise SystemExit("source file must not be empty")
+    source_hash = sha256_file(source)
 
     with init_lock(exports_root):
         reusable = find_reusable_run(exports_root, args.mode, args.account, source_hash)
@@ -214,9 +254,8 @@ def init_run(args: argparse.Namespace) -> int:
         pipeline_dir.chmod(0o700)
 
         input_path = pipeline_dir / "input.md"
-        if source:
-            input_path.write_bytes(source.read_bytes())
-            input_path.chmod(0o400)
+        input_path.write_bytes(source.read_bytes())
+        input_path.chmod(0o400)
 
         data = {
             "protocol_version": PROTOCOL_VERSION,
@@ -226,11 +265,16 @@ def init_run(args: argparse.Namespace) -> int:
             "canonical_output_dir": str(run_dir),
             "input_path": str(input_path),
             "source_sha256": source_hash,
-            "status": "input_sealed" if source else "awaiting_input",
+            "status": "input_sealed",
+            "revision": 0,
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
         }
+        data["state_checksum"] = state_checksum(data)
         write_json(pipeline_dir / "run.json", data)
+        from runtime_integrity import capture as capture_runtime
+
+        capture_runtime(run_dir, data)
         append_event(
             run_dir,
             data,
@@ -262,6 +306,7 @@ def seal_run(args: argparse.Namespace) -> int:
     data["source_sha256"] = source_hash
     data["status"] = "input_sealed"
     data["updated_at"] = datetime.now().astimezone().isoformat()
+    data["state_checksum"] = state_checksum(data)
     write_json(run_path, data)
     append_event(run_dir, data, "input.sealed", args.actor, {"source_sha256": source_hash})
     print(json.dumps(data, ensure_ascii=False))
@@ -273,46 +318,82 @@ def set_status(args: argparse.Namespace) -> int:
         raise SystemExit("run status may only be changed by actor wechat-leader")
     run_dir = args.run_dir.expanduser().resolve()
     run_path = run_dir / ".pipeline" / "run.json"
-    data = load_json(run_path)
-    validate_run_identity(run_dir, data)
-    current = str(data.get("status", ""))
-    transitions = MODE_STATUS_TRANSITIONS.get(str(data.get("mode", "")))
-    if transitions is None:
-        raise SystemExit(f"unknown run mode: {data.get('mode')!r}")
-    if current not in transitions:
-        raise SystemExit(f"unknown current run status: {current}")
-    allowed = transitions[current]
-    if current == "failed":
-        failed_from = str(data.get("failed_from", ""))
-        allowed = {failed_from, "cancelled"} if failed_from else {"cancelled"}
-    if args.status != current and args.status not in allowed:
-        raise SystemExit(f"invalid run status transition: {current} -> {args.status}")
-    if args.status == "published" and current != "published":
-        from validate_publish_result import validate as validate_publish_receipt
-
-        receipt_errors, _ = validate_publish_receipt(run_dir)
-        if receipt_errors:
-            raise SystemExit(
-                "cannot mark published: " + "; ".join(receipt_errors)
+    with run_lock(run_dir):
+        data = load_json(run_path)
+        validate_run_identity(run_dir, data)
+        current = str(data.get("status", ""))
+        transitions = MODE_STATUS_TRANSITIONS.get(str(data.get("mode", "")))
+        if transitions is None:
+            raise SystemExit(f"unknown run mode: {data.get('mode')!r}")
+        if current not in transitions:
+            raise SystemExit(f"unknown current run status: {current}")
+        allowed = transitions[current]
+        if current == "failed":
+            failed_from = str(data.get("failed_from", ""))
+            allowed = {failed_from, "cancelled"} if failed_from else {"cancelled"}
+        if args.status != current and args.status not in allowed:
+            raise SystemExit(f"invalid run status transition: {current} -> {args.status}")
+        if args.status != current:
+            validate_transition_gate(run_dir, data, args.status)
+        if args.status == "failed" and current != "failed":
+            data["failed_from"] = current
+        elif current == "failed" and args.status != "failed":
+            data.pop("failed_from", None)
+        previous = current
+        data["status"] = args.status
+        data["revision"] = int(data.get("revision", 0)) + (args.status != previous)
+        data["updated_at"] = datetime.now().astimezone().isoformat()
+        data["state_checksum"] = state_checksum(data)
+        write_json(run_path, data)
+        if args.status != previous:
+            append_event(
+                run_dir,
+                data,
+                "status.changed",
+                args.actor,
+                {"from": previous, "to": args.status, "revision": data["revision"]},
             )
-    if args.status == "failed" and current != "failed":
-        data["failed_from"] = current
-    elif current == "failed" and args.status != "failed":
-        data.pop("failed_from", None)
-    previous = current
-    data["status"] = args.status
-    data["updated_at"] = datetime.now().astimezone().isoformat()
-    write_json(run_path, data)
-    if args.status != previous:
-        append_event(
-            run_dir,
-            data,
-            "status.changed",
-            args.actor,
-            {"from": previous, "to": args.status},
-        )
     print(json.dumps(data, ensure_ascii=False))
     return 0
+
+
+def validate_transition_gate(run_dir: Path, data: dict, target: str) -> None:
+    """Run the deterministic gate required to enter one target state."""
+    if target not in {"failed", "cancelled"}:
+        from runtime_integrity import validate as validate_runtime
+
+        errors, _ = validate_runtime(run_dir, data)
+        if errors:
+            raise SystemExit("runtime integrity gate failed: " + "; ".join(errors))
+    if target == "content_ready":
+        from prepare_content import validate_content_artifact
+
+        errors, _ = validate_content_artifact(run_dir)
+    elif target == "rendering":
+        from validate_designer_manifest import validate
+
+        errors = validate(run_dir / ".pipeline" / "manifest.json", "plan")
+    elif target == "artwork_ready":
+        from validate_designer_manifest import validate
+
+        errors = validate(run_dir / ".pipeline" / "manifest.json", "publish-ready")
+    elif target == "layout_ready":
+        from validate_article_layout import validate
+
+        result = validate(run_dir / "article-body.html", run_dir / ".pipeline" / "layout.json")
+        errors = list(result.get("errors", [])) + list(result.get("warnings", []))
+    elif target in {"publish_ready", "publishing"}:
+        from build_publish_snapshot import validate_snapshot
+
+        errors, _ = validate_snapshot(run_dir)
+    elif target == "published":
+        from validate_publish_result import validate
+
+        errors, _ = validate(run_dir)
+    else:
+        errors = []
+    if errors:
+        raise SystemExit(f"cannot enter {target}: " + "; ".join(errors))
 
 
 def record_event(args: argparse.Namespace) -> int:
@@ -340,6 +421,17 @@ def update_progress(args: argparse.Namespace) -> int:
         raise SystemExit("progress actor must not be empty")
     if args.completed < 0 or args.total < 0 or args.completed > args.total:
         raise SystemExit("progress requires 0 <= completed <= total")
+    allowed_statuses = {
+        "wechat-formatter": {"formatting"},
+        "wechat-designer": {"planning", "rendering"},
+        "wechat-typesetter": {"typesetting"},
+        "wechat-publisher": {"publishing"},
+    }
+    actor_statuses = allowed_statuses.get(args.actor)
+    if actor_statuses is None or data.get("status") not in actor_statuses:
+        raise SystemExit(
+            f"progress actor {args.actor!r} cannot report while status is {data.get('status')!r}"
+        )
     payload = {
         "schema_version": 1,
         "protocol_version": PROTOCOL_VERSION,
@@ -375,7 +467,7 @@ def main() -> int:
     init_parser.add_argument("--mode", choices=("newspic", "news"), required=True)
     init_parser.add_argument("--account", required=True)
     init_parser.add_argument("--slug", required=True)
-    init_parser.add_argument("--source", type=Path)
+    init_parser.add_argument("--source", type=Path, required=True)
     init_parser.add_argument("--exports-root", type=Path, default=default_exports_root())
     init_parser.add_argument("--force-new", action="store_true")
     init_parser.set_defaults(func=init_run)
@@ -389,7 +481,7 @@ def main() -> int:
     status_parser.add_argument("run_dir", type=Path)
     status_parser.add_argument(
         "status",
-        choices=("awaiting_input", "input_sealed", "planning", "rendering", "ready", "typesetting", "layout_ready", "publishing", "published", "failed", "cancelled"),
+        choices=("awaiting_input", "input_sealed", "formatting", "content_ready", "planning", "rendering", "artwork_ready", "typesetting", "layout_ready", "publish_ready", "publishing", "published", "failed", "cancelled"),
     )
     status_parser.add_argument("--actor", required=True)
     status_parser.set_defaults(func=set_status)

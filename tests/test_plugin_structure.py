@@ -113,8 +113,11 @@ class PluginStructureTests(unittest.TestCase):
             self.assertNotRegex(text, r"2026-07-11-00(?!2)\d", str(path))
 
         protocol = (ROOT / "docs" / "wechat-pipeline-protocol.md").read_text(encoding="utf-8")
-        self.assertIn("newspic: input_sealed -> planning -> rendering -> ready -> publishing -> published", protocol)
-        self.assertIn("news:    input_sealed -> planning -> rendering -> ready -> typesetting -> layout_ready -> publishing -> published", protocol)
+        self.assertIn("input_sealed", protocol)
+        self.assertIn("formatting", protocol)
+        self.assertIn("content_ready", protocol)
+        self.assertIn("artwork_ready", protocol)
+        self.assertIn("publish_ready", protocol)
 
     def test_baoyu_snapshot_matches_lock(self) -> None:
         lock = json.loads(

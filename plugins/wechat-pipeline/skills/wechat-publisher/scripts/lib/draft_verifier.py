@@ -19,7 +19,11 @@ class _DraftHTMLParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() == "img":
-            source = dict(attrs).get("src")
+            # WeChat draft/get stores body images with data-src (lazy-load
+            # attribute), while freshly submitted HTML uses src. Accept either
+            # so the read-back image count reflects the actual draft content.
+            attrs_dict = dict(attrs)
+            source = attrs_dict.get("src") or attrs_dict.get("data-src")
             if source:
                 self.images.append(source)
 

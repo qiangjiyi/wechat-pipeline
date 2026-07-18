@@ -67,6 +67,7 @@ htmlcov/
 /wechat-pipeline-exports/
 .baoyu-sync-stage-*/
 .baoyu-sync-backup-*/
+plugins/wechat-pipeline/.in_use/
 
 # Internal review inputs (decisions belong in docs/review-decisions.md)
 /docs/wechat-pipeline-review-*.md
