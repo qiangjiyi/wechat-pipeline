@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+- 新增 `load_extend.py` 确定性解析 EXTEND.md（project / XDG / user-home 三级，外加 legacy `baoyu-imagine`），替代交给 LLM 不可靠的三级路径查找；Designer 直接读取解析结果。非交互模式下 EXTEND.md 未命中不再记为 `contract_error`，回退 Skill 内置默认值（`preferences.source=auto`，不记 `extend_path`）并继续生成。
+- 流水线运行时降到约 10 分钟：Typesetter 与剩余图片生成并行、publish-ready 校验与 `gzh-design` 排版并发，Designer worker 自验自修复只返回最终结果。
+
+## 0.3.0
 
 - 协议升级到 `2026-07-13-001`：状态只由 Leader 写入，并新增只追加的运行事件日志。
 - 新增 Python 3.10+ 自动解析启动器，避免系统 `python3` 版本过旧阻断可用运行时。
