@@ -53,6 +53,8 @@ If structured Skill inputs are unavailable, include both the exact namespaced Sk
 
 The worker must execute the attached Skill's current `SKILL.md`, references, and selected `EXTEND.md` natively. It must not reconstruct the workflow from this coordinator summary.
 
+`EXTEND.md` is resolved deterministically by the designer via `${PIPELINE_ROOT}/scripts/load_extend.py <skill> --base-dir <run-dir> --json`; the worker reads that absolute path directly instead of the skill's internal 3-tier lookup (which relies on shell parameter expansion and is unreliable when delegated to an LLM). When not found in non-interactive mode, the worker falls back to built-in defaults (`preferences.source=auto`, no `extend_path`) and must not trigger first-time setup, block, or return `contract_error`.
+
 ### Waiting Strategy (Phase 1 Optimization: Zero Long Sleep)
 
 **NEVER use sleep commands longer than 10 seconds.** `sleep 30`, `sleep 60`, `sleep 120`, `sleep 180` are all FORBIDDEN.

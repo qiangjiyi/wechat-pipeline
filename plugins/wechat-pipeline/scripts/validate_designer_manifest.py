@@ -200,6 +200,8 @@ def validate_skill_contract(manifest: dict, base_dir: Path, errors: list[str]) -
         errors.append("preferences.source must be user, extend, or auto")
     extend_path = preferences.get("extend_path")
     extend_hash = preferences.get("extend_sha256")
+    if preferences.get("source") == "extend" and not extend_path:
+        errors.append("preferences.source=extend requires a non-empty extend_path")
     if extend_path:
         path = resolve_path(str(extend_path), base_dir)
         if not path.is_file():

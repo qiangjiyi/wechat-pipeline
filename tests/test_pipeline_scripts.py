@@ -592,6 +592,113 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("does not match EXTEND.md preferred_style", result.stdout)
 
+    def test_extend_source_requires_extend_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["skill_contract"]["preferences"] = {"source": "extend", "style": "sketch-notes"}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = self.run_script("validate_designer_manifest.py", str(manifest_path), "--phase", "plan")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("source=extend requires a non-empty extend_path", result.stdout)
+
+    def test_auto_source_without_extend_path_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest_path = self.make_run(Path(temp), status="success")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["skill_contract"]["preferences"] = {"source": "auto", "style": "sketch-notes"}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = self.run_script("validate_designer_manifest.py", str(manifest_path), "--phase", "plan")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def run_load_extend(self, skill: str, base_dir: Path, env: dict) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [PYTHON, str(ROOT / "scripts" / "load_extend.py"), skill,
+             "--base-dir", str(base_dir), "--json"],
+            capture_output=True, text=True, check=False, env=env,
+        )
+
+    def test_load_extend_prefers_project_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            project = root / "proj"
+            project_extend = project / ".baoyu-skills" / "baoyu-xhs-images" / "EXTEND.md"
+            project_extend.parent.mkdir(parents=True)
+            project_extend.write_text("preferred_style: sketch-notes\n", encoding="utf-8")
+            home_extend = home / ".baoyu-skills" / "baoyu-xhs-images" / "EXTEND.md"
+            home_extend.parent.mkdir(parents=True)
+            home_extend.write_text("preferred_style: fresh\n", encoding="utf-8")
+            env = {**os.environ, "HOME": str(home)}
+            result = self.run_load_extend("baoyu-xhs-images", project, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["found"])
+            self.assertEqual(data["source"], "project")
+            self.assertEqual(Path(data["path"]), project_extend.resolve())
+            self.assertEqual(data["sha256"], sha256(project_extend))
+
+    def test_load_extend_falls_through_to_user_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home_extend = home / ".baoyu-skills" / "baoyu-image-gen" / "EXTEND.md"
+            home_extend.parent.mkdir(parents=True)
+            home_extend.write_text("default_provider: codex-cli\n", encoding="utf-8")
+            env = {**os.environ, "HOME": str(home)}
+            result = self.run_load_extend("baoyu-image-gen", root / "empty-proj", env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["found"])
+            self.assertEqual(data["source"], "home")
+            self.assertEqual(Path(data["path"]), home_extend.resolve())
+
+    def test_load_extend_reports_not_found_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            env = {**os.environ, "HOME": str(home)}
+            result = self.run_load_extend("baoyu-xhs-images", root / "proj", env)
+            # Not found is exit code 1 (a clean "absent" signal), not a crash.
+            self.assertEqual(result.returncode, 1)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["found"])
+            self.assertIsNone(data["path"])
+            self.assertEqual(len(data["searched"]), 3)
+
+    def test_load_extend_respects_xdg_config_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            xdg = root / "xdg"
+            xdg_extend = xdg / "baoyu-skills" / "baoyu-cover-image" / "EXTEND.md"
+            xdg_extend.parent.mkdir(parents=True)
+            xdg_extend.write_text("quick_mode: true\n", encoding="utf-8")
+            env = {**os.environ, "HOME": str(home), "XDG_CONFIG_HOME": str(xdg)}
+            result = self.run_load_extend("baoyu-cover-image", root / "proj", env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["source"], "xdg")
+            self.assertEqual(Path(data["path"]), xdg_extend.resolve())
+
+    def test_load_extend_detects_legacy_baoyu_imagine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            legacy = home / ".baoyu-skills" / "baoyu-imagine" / "EXTEND.md"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("default_provider: codex-cli\n", encoding="utf-8")
+            env = {**os.environ, "HOME": str(home)}
+            result = self.run_load_extend("baoyu-image-gen", root / "proj", env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["found"])
+            self.assertEqual(data["source"], "legacy-home")
+            self.assertEqual(data["legacy_skill"], "baoyu-imagine")
+
     def test_publish_ready_rejects_missing_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             manifest_path = self.make_run(Path(temp), status="success")
