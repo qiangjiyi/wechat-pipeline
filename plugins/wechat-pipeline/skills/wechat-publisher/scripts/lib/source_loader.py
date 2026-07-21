@@ -3,80 +3,48 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
+PLUGIN_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(PLUGIN_ROOT))
+
 from .errors import CONTENT_MAX_CHARS, MAX_IMAGES, PublishError, TITLE_MAX_CHARS
-
-
-def parse_scalar(value: str):
-    value = value.strip()
-    if value in ("", "null", "Null", "NULL", "~"):
-        return None
-    if value in ("true", "True", "TRUE"):
-        return True
-    if value in ("false", "False", "FALSE"):
-        return False
-    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-        return value[1:-1]
-    return value
+from shared.markdown_meta import (
+    first_h1,
+    frontmatter,
+    markdown_body,
+    parse_simple_yaml as _parse_simple_yaml,
+    title as markdown_title,
+)
 
 
 def parse_simple_yaml(text: str) -> dict:
-    data: dict[str, object] = {}
-    current_list: str | None = None
-    for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        if raw_line.startswith(" ") or raw_line.startswith("\t"):
-            if current_list and raw_line.strip().startswith("- "):
-                item = raw_line.strip()[2:].strip()
-                data.setdefault(current_list, [])
-                assert isinstance(data[current_list], list)
-                data[current_list].append(parse_scalar(item))
-                continue
-            raise PublishError(f"unsupported YAML line: {raw_line}")
-        if ":" not in raw_line:
-            raise PublishError(f"unsupported YAML line: {raw_line}")
-        key, value = raw_line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if not value:
-            data[key] = []
-            current_list = key
-        else:
-            data[key] = parse_scalar(value)
-            current_list = None
-    return data
-
-
-def split_frontmatter(text: str) -> tuple[str, str]:
-    lines = text.splitlines()
-    if lines and lines[0].strip() == "---":
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "---":
-                return "\n".join(lines[1:i]), "\n".join(lines[i + 1:])
-    return "", text
+    """Expose the shared flat parser through the publisher's public error type."""
+    try:
+        return _parse_simple_yaml(text)
+    except ValueError as err:
+        raise PublishError(str(err)) from err
 
 
 def parse_markdown(text: str) -> dict:
     """Parse source.md format: optional YAML frontmatter, then first H1 = title, rest = content."""
-    frontmatter, body = split_frontmatter(text)
-    data = parse_simple_yaml(frontmatter) if frontmatter.strip() else {}
+    data = frontmatter(text)
+    body = markdown_body(text)
     body_lines = body.splitlines()
-    title = None
+    parsed_title = first_h1(text)
     content_start = 0
     for idx, line in enumerate(body_lines):
         if not line.strip():
             continue
         if line.lstrip().startswith("# "):
-            title = line.lstrip()[2:].strip()
             content_start = idx + 1
         else:
             content_start = idx
         break
     content = "\n".join(body_lines[content_start:]).strip()
-    if title and not data.get("title"):
-        data["title"] = title
+    if parsed_title and not data.get("title"):
+        data["title"] = parsed_title
     if content and not data.get("content"):
         data["content"] = content
     return data
@@ -85,14 +53,17 @@ def parse_markdown(text: str) -> dict:
 def load_source(path: Path) -> dict:
     text = path.read_text(encoding="utf-8")
     suffix = path.suffix.lower()
-    if suffix == ".json":
-        data = json.loads(text)
-    elif suffix in (".yaml", ".yml"):
-        data = parse_simple_yaml(text)
-    elif suffix in (".md", ".markdown"):
-        data = parse_markdown(text)
-    else:
-        raise PublishError("source must be .md, .yaml, .yml, or .json")
+    try:
+        if suffix == ".json":
+            data = json.loads(text)
+        elif suffix in (".yaml", ".yml"):
+            data = parse_simple_yaml(text)
+        elif suffix in (".md", ".markdown"):
+            data = parse_markdown(text)
+        else:
+            raise PublishError("source must be .md, .yaml, .yml, or .json")
+    except ValueError as err:
+        raise PublishError(str(err)) from err
     if not isinstance(data, dict):
         raise PublishError("source must contain an object at the top level")
     return data

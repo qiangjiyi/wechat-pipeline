@@ -1,3 +1,3 @@
 """Shared machine-readable protocol version."""
 
-PROTOCOL_VERSION = "2026-07-18-001"
+PROTOCOL_VERSION = "2026-07-20-001"

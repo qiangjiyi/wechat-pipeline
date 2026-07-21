@@ -6,35 +6,35 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT))
+
+from integrity import validate_runtime
 from protocol_version import PROTOCOL_VERSION
 from prepare_content import validate_content_artifact
-from runtime_integrity import validate as validate_runtime
-from validate_article_layout import validate as validate_layout
+from prepare_layout import validate_layout_evidence
+from shared.hashing import sha256_file
+from shared.jsonio import write_json
+from skill_run import formatter_paths
 from validate_designer_manifest import validate as validate_manifest
 
 
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 VALIDATORS = (
-    PLUGIN_ROOT / "scripts" / "runtime_integrity.py",
+    PLUGIN_ROOT / "scripts" / "integrity.py",
+    PLUGIN_ROOT / "scripts" / "run_context.py",
+    PLUGIN_ROOT / "scripts" / "skill_run.py",
     PLUGIN_ROOT / "scripts" / "prepare_content.py",
     PLUGIN_ROOT / "scripts" / "validate_designer_manifest.py",
+    PLUGIN_ROOT / "scripts" / "prepare_layout.py",
     PLUGIN_ROOT / "scripts" / "validate_article_layout.py",
     PLUGIN_ROOT / "scripts" / "build_publish_snapshot.py",
     PLUGIN_ROOT / "scripts" / "validate_publish_result.py",
 )
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def fingerprint(value: dict) -> str:
@@ -50,14 +50,6 @@ def file_binding(path: Path) -> dict:
     return {"path": str(path), "sha256": sha256_file(path)}
 
 
-def write_json(path: Path, value: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
-    path.chmod(0o400)
-
-
 def build(run_dir: Path) -> dict:
     pipeline = run_dir / ".pipeline"
     run = json.loads((pipeline / "run.json").read_text(encoding="utf-8"))
@@ -67,12 +59,11 @@ def build(run_dir: Path) -> dict:
     format_errors, format_receipt = validate_content_artifact(run_dir)
     errors.extend(format_errors)
     manifest_path = pipeline / "manifest.json"
-    errors.extend(validate_manifest(manifest_path, "publish-ready"))
+    errors.extend(validate_manifest(manifest_path))
     layout_result: dict | None = None
     if run.get("mode") == "news":
-        layout_result = validate_layout(run_dir / "article-body.html", pipeline / "layout.json")
-        errors.extend(layout_result.get("errors", []))
-        errors.extend(layout_result.get("warnings", []))
+        layout_errors, layout_result = validate_layout_evidence(run_dir)
+        errors.extend(layout_errors)
     if errors:
         raise SystemExit("publish snapshot preflight failed: " + "; ".join(errors))
 
@@ -85,6 +76,7 @@ def build(run_dir: Path) -> dict:
         }
         for image in manifest.get("images", [])
     ]
+    formatter_receipt, _, _, _, formatter_output = formatter_paths(run_dir)
     core = {
         "schema_version": 1,
         "protocol_version": PROTOCOL_VERSION,
@@ -93,6 +85,8 @@ def build(run_dir: Path) -> dict:
         "account": run.get("account"),
         "canonical_output_dir": str(run_dir),
         "source": file_binding(pipeline / "input.md"),
+        "formatter_skill_run": file_binding(formatter_receipt),
+        "formatter_output": file_binding(formatter_output),
         "content": file_binding(run_dir / "content.md"),
         "format_result": file_binding(pipeline / "format-result.json"),
         "manifest": file_binding(manifest_path),
@@ -115,6 +109,10 @@ def build(run_dir: Path) -> dict:
         metadata = layout_manifest.get("metadata") if isinstance(layout_manifest.get("metadata"), dict) else {}
         cover = next(image for image in images if image.get("kind") == "cover")
         core.update({
+            "layout_skill_run": file_binding(pipeline / "layout-skill-run.json"),
+            "layout_native_output": file_binding(
+                Path(str(layout_manifest.get("output", {}).get("native_output_path", ""))).expanduser().resolve()
+            ),
             "layout": file_binding(layout_path),
             "html": file_binding(html_path),
             "cover": cover,
@@ -147,21 +145,19 @@ def validate_binding(value: object, label: str, run_dir: Path, errors: list[str]
         errors.append(f"snapshot {label} hash mismatch: {path}")
 
 
-def validate_snapshot(run_dir: Path) -> tuple[list[str], dict | None]:
+def validate_snapshot_evidence(run_dir: Path) -> tuple[list[str], dict | None]:
+    """Validate the sealed snapshot itself without rehashing all bound artifacts."""
     errors: list[str] = []
-    path = snapshot_path(run_dir)
     try:
-        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        snapshot = json.loads(snapshot_path(run_dir).read_text(encoding="utf-8"))
         run = json.loads((run_dir / ".pipeline" / "run.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as err:
-        return [f"unable to read publish snapshot: {err}"], None
-    check_runtime = run.get("status") != "published"
+        return [f"unable to read publish snapshot evidence: {err}"], None
     if snapshot.get("protocol_version") != PROTOCOL_VERSION:
         errors.append(f"snapshot protocol_version must be {PROTOCOL_VERSION}")
-    if snapshot.get("run_id") != run.get("run_id") or snapshot.get("mode") != run.get("mode"):
-        errors.append("snapshot run identity does not match run.json")
-    if snapshot.get("account") != run.get("account"):
-        errors.append("snapshot account does not match run.json")
+    for key in ("run_id", "mode", "account"):
+        if snapshot.get(key) != run.get(key):
+            errors.append(f"snapshot {key} does not match run.json")
     if Path(str(snapshot.get("canonical_output_dir", ""))).expanduser().resolve() != run_dir:
         errors.append("snapshot canonical_output_dir mismatch")
     claimed = snapshot.get("fingerprint")
@@ -169,13 +165,27 @@ def validate_snapshot(run_dir: Path) -> tuple[list[str], dict | None]:
     core.pop("fingerprint", None)
     if claimed != fingerprint(core):
         errors.append("snapshot fingerprint is invalid")
+    return errors, snapshot
+
+
+def validate_snapshot(run_dir: Path) -> tuple[list[str], dict | None]:
+    errors, snapshot = validate_snapshot_evidence(run_dir)
+    if snapshot is None:
+        return errors, None
+    run = json.loads((run_dir / ".pipeline" / "run.json").read_text(encoding="utf-8"))
+    check_runtime = run.get("status") != "published"
+    formatter_receipt, _, _, _, formatter_output = formatter_paths(run_dir)
     fixed_paths = {
         "source": run_dir / ".pipeline" / "input.md",
+        "formatter_skill_run": formatter_receipt,
+        "formatter_output": formatter_output,
         "content": run_dir / "content.md",
         "format_result": run_dir / ".pipeline" / "format-result.json",
         "manifest": run_dir / ".pipeline" / "manifest.json",
     }
-    for label in ("source", "content", "format_result", "manifest"):
+    for label in (
+        "source", "formatter_skill_run", "formatter_output", "content", "format_result", "manifest"
+    ):
         validate_binding(snapshot.get(label), label, run_dir, errors)
         if isinstance(snapshot.get(label), dict):
             actual_path = Path(str(snapshot[label].get("path", ""))).expanduser().resolve()
@@ -219,9 +229,10 @@ def validate_snapshot(run_dir: Path) -> tuple[list[str], dict | None]:
         if publication != expected_publication:
             errors.append("newspic publication metadata does not match formatted content and sealed source")
     if snapshot.get("mode") == "news":
-        for label in ("layout", "html", "cover"):
+        for label in ("layout_skill_run", "layout_native_output", "layout", "html", "cover"):
             validate_binding(snapshot.get(label), label, run_dir, errors)
         expected_news_paths = {
+            "layout_skill_run": run_dir / ".pipeline" / "layout-skill-run.json",
             "layout": run_dir / ".pipeline" / "layout.json",
             "html": run_dir / "article-body.html",
         }
@@ -240,6 +251,12 @@ def validate_snapshot(run_dir: Path) -> tuple[list[str], dict | None]:
         except (OSError, json.JSONDecodeError):
             layout_manifest = {}
         metadata = layout_manifest.get("metadata") if isinstance(layout_manifest.get("metadata"), dict) else {}
+        native_output = layout_manifest.get("output") if isinstance(layout_manifest.get("output"), dict) else {}
+        expected_native_path = Path(str(native_output.get("native_output_path", ""))).expanduser().resolve()
+        if isinstance(snapshot.get("layout_native_output"), dict):
+            actual_native_path = Path(str(snapshot["layout_native_output"].get("path", ""))).expanduser().resolve()
+            if actual_native_path != expected_native_path:
+                errors.append("snapshot layout_native_output does not match layout manifest")
         expected_publication = {
             "title": metadata.get("title"),
             "author": metadata.get("author") or "",
@@ -296,7 +313,7 @@ def main() -> int:
         print(json.dumps({"reused": True, **(snapshot or {})}, ensure_ascii=False))
         return 0
     snapshot = build(run_dir)
-    write_json(path, snapshot)
+    write_json(path, snapshot, mode=0o400)
     print(json.dumps({"reused": False, **snapshot}, ensure_ascii=False))
     return 0
 

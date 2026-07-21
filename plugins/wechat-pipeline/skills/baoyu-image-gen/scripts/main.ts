@@ -64,7 +64,7 @@ const DEFAULT_PROVIDER_RATE_LIMITS: Record<Provider, ProviderRateLimit> = {
   jimeng: { concurrency: 3, startIntervalMs: 1100 },
   seedream: { concurrency: 3, startIntervalMs: 1100 },
   azure: { concurrency: 3, startIntervalMs: 1100 },
-  "codex-cli": { concurrency: 1, startIntervalMs: 2000 },
+  "codex-cli": { concurrency: 2, startIntervalMs: 1000 },
   agnes: { concurrency: 3, startIntervalMs: 1100 },
 };
 
@@ -174,6 +174,7 @@ export function parseArgs(argv: string[]): CliArgs {
     promptFiles: [],
     imagePath: null,
     provider: null,
+    providerSource: null,
     model: null,
     aspectRatio: null,
     aspectRatioSource: null,
@@ -274,6 +275,7 @@ export function parseArgs(argv: string[]): CliArgs {
         throw new Error(`Invalid provider: ${v}`);
       }
       out.provider = v;
+      out.providerSource = "cli";
       continue;
     }
 
@@ -618,6 +620,7 @@ export function mergeConfig(args: CliArgs, extend: Partial<ExtendConfig>): CliAr
   return {
     ...args,
     provider: args.provider ?? extend.default_provider ?? null,
+    providerSource: args.providerSource ?? (extend.default_provider ? "config" : null),
     quality: args.quality ?? extend.default_quality ?? null,
     aspectRatio,
     aspectRatioSource:
@@ -1000,7 +1003,16 @@ export function createTaskArgs(baseArgs: CliArgs, task: BatchTaskInput, batchDir
     prompt: task.prompt ?? null,
     promptFiles: task.promptFiles ? task.promptFiles.map((filePath) => resolveBatchPath(batchDir, filePath)) : [],
     imagePath: task.image ? resolveBatchPath(batchDir, task.image) : null,
-    provider: task.provider ?? baseArgs.provider ?? null,
+    provider:
+      baseArgs.providerSource === "cli"
+        ? baseArgs.provider
+        : task.provider ?? baseArgs.provider ?? null,
+    providerSource:
+      baseArgs.providerSource === "cli"
+        ? "cli"
+        : task.provider
+          ? "config"
+          : baseArgs.providerSource ?? null,
     model: task.model ?? baseArgs.model ?? null,
     aspectRatio: task.ar ?? baseArgs.aspectRatio ?? null,
     aspectRatioSource: task.ar != null ? "task" : (baseArgs.aspectRatioSource ?? null),

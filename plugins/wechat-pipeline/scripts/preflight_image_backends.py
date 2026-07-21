@@ -49,22 +49,19 @@ def command_output(command: list[str]) -> str | None:
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--env-file", type=Path, default=Path("~/.baoyu-skills/.env"))
-    parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
-
-    env_file = args.env_file.expanduser().resolve()
+def probe_image_backends(env_file: Path | None = None) -> dict:
+    env_file = (env_file or Path("~/.baoyu-skills/.env")).expanduser().resolve()
     values = load_dotenv(env_file)
     merged = {**values, **{key: value for key, value in os.environ.items() if value}}
 
     codex_path = shutil.which("codex")
+    codex_login_status = command_output([codex_path, "login", "status"]) if codex_path else None
     providers = [{
         "name": "codex-cli",
         "configured": bool(codex_path),
         "executable": codex_path,
         "version": command_output([codex_path, "--version"]) if codex_path else None,
+        "login_status": codex_login_status,
         "note": "availability only; model compatibility is decided by the real render attempt",
     }]
     for name, keys in PROVIDER_KEYS.items():
@@ -74,12 +71,21 @@ def main() -> int:
             "required_keys": list(keys),
         })
 
-    result = {
+    return {
         "env_file": str(env_file),
         "env_file_exists": env_file.is_file(),
         "providers": providers,
         "fallback_order": [item["name"] for item in providers if item["configured"]],
     }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env-file", type=Path, default=Path("~/.baoyu-skills/.env"))
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+
+    result = probe_image_backends(args.env_file)
     payload = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         output = args.output.expanduser().resolve()

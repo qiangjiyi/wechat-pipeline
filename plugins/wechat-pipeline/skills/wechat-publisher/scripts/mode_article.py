@@ -279,6 +279,9 @@ def _run_html(args, html_path: Path) -> int:
         }, ensure_ascii=False, indent=2))
         return 0
 
+    if snapshot_binding and snapshot_binding["run_status"] != "publishing":
+        raise PublishError("real pipeline publishing requires run status publishing")
+
     if cover_path is None:
         raise PublishError("pre-typeset HTML requires --cover or layout manifest metadata.cover_path")
     if not args.yes:

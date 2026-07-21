@@ -6,6 +6,7 @@ import hashlib
 import html as html_module
 import mimetypes
 import re
+import sys
 import tempfile
 import urllib.parse
 import urllib.request
@@ -13,18 +14,17 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
 
+PLUGIN_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(PLUGIN_ROOT))
+
 from lib.errors import PublishError, USER_AGENT
+from shared.html_contracts import PLACEHOLDER_PATTERNS
 
 
 MAX_HTML_BYTES = 1_000_000
 MAX_REMOTE_IMAGE_BYTES = 20_000_000
 IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 DOCUMENT_TAG = re.compile(r"<!doctype\b|</?(?:html|head|body)(?:\s|>)", re.I)
-PLACEHOLDER_PATTERNS = (
-    re.compile(r"\{\{[^{}]+\}\}"),
-    re.compile(r"(?:图片|动图|封面|名片)(?:URL|地址)"),
-    re.compile(r"【(?:插入|待补)[^】]*】"),
-)
 IMG_TAG = re.compile(r"<img\b[^>]*>", re.I | re.S)
 SRC_ATTR = re.compile(
     r"(?P<prefix>(?<![\w:-])src\s*=\s*)(?:(?P<quote>['\"])(?P<quoted>.*?)(?P=quote)|(?P<bare>[^\s>]+))",

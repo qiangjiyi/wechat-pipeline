@@ -42,7 +42,7 @@ codex --version        # confirm >= 0.130
 | `BAOYU_CODEX_IMAGEGEN_TIMEOUT_MS` | Per-attempt `codex exec` timeout in ms. Default: `300000` (5 min). Raise for slow networks or large prompts. |
 | `BAOYU_CODEX_IMAGEGEN_RETRIES` | Wrapper-side retry attempts on retryable errors. Default: `2` (3 total attempts). |
 | `BAOYU_CODEX_IMAGEGEN_LOG_FILE` | Append a structured JSONL diagnostic log. Useful when triaging timeouts or `agent_refused` errors. |
-| `BAOYU_IMAGE_GEN_CODEX_CLI_CONCURRENCY` | Batch-mode concurrency for the `codex-cli` provider. Default: `1` — Codex exec is a heavy single-process workflow; raising this rarely helps. |
+| `BAOYU_IMAGE_GEN_CODEX_CLI_CONCURRENCY` | Batch-mode concurrency for the `codex-cli` provider. Default: `2`; lower to `1` on memory-constrained hosts. |
 | `BAOYU_IMAGE_GEN_CODEX_CLI_START_INTERVAL_MS` | Batch-mode minimum start-gap. Default: `2000` ms. |
 
 ## Error model
@@ -67,7 +67,6 @@ The provider re-throws each wrapper error as `Invalid codex-cli result (<error_k
 | `no_image_gen_tool_use` | Codex agent answered without calling `image_gen` | Often transient — retry. If persistent, refine the prompt. |
 | `output_missing` / `invalid_png` | Agent reported success but file is absent or not a valid PNG | Retry; check disk space. |
 | `agent_refused` | Codex agent refused (policy or content) | Adjust the prompt; surface the refusal to the user. |
-| `lock_busy` | Another `codex-imagegen` invocation holds the file lock | Wait or set a distinct `--cache-dir` per concurrent caller. |
 
 ## Trade-offs
 

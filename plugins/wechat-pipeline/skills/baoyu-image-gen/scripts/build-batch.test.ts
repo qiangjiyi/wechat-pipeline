@@ -37,7 +37,7 @@ async function makeFixture(): Promise<{
 }
 
 async function runBuildBatch(args: string[]): Promise<void> {
-  await execFileAsync(process.execPath, ["--import", "tsx", scriptPath, ...args], {
+  await execFileAsync("npx", ["-y", "tsx", scriptPath, ...args], {
     cwd: repoRoot,
   });
 }
@@ -59,8 +59,28 @@ test("build-batch omits default model so baoyu-image-gen can resolve env or EXTE
   };
 
   assert.equal(batch.tasks.length, 1);
-  assert.equal(batch.tasks[0]?.provider, "replicate");
+  assert.equal(Object.hasOwn(batch.tasks[0]!, "provider"), false);
   assert.equal(Object.hasOwn(batch.tasks[0]!, "model"), false);
+});
+
+test("build-batch preserves an explicit provider without inventing a default", async () => {
+  const fixture = await makeFixture();
+
+  await runBuildBatch([
+    "--outline",
+    fixture.outlinePath,
+    "--prompts",
+    fixture.promptsDir,
+    "--output",
+    fixture.outputPath,
+    "--provider",
+    "codex-cli",
+  ]);
+
+  const batch = JSON.parse(await fs.readFile(fixture.outputPath, "utf8")) as {
+    tasks: Array<Record<string, unknown>>;
+  };
+  assert.equal(batch.tasks[0]?.provider, "codex-cli");
 });
 
 test("build-batch preserves explicit model overrides", async () => {

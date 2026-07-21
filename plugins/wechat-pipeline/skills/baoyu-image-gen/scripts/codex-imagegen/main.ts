@@ -1,13 +1,12 @@
 #!/usr/bin/env bun
 import { readFile, mkdir, copyFile, stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { GenError, type CliOptions, type GenerateResult } from "./types.ts";
 import { runCodexExec } from "./spawn.ts";
 import { hasImageGenEvidence, verifyImageGenWasInvoked, verifyOutput } from "./validator.ts";
-import { cacheKey, lookupCache, storeCache, FileLock } from "./cache.ts";
+import { cacheKey, lookupCache, storeCache } from "./cache.ts";
 import { JsonLogger } from "./logger.ts";
 
 const HELP = `codex-imagegen — generate images via Codex CLI's image_gen tool
@@ -229,60 +228,47 @@ async function generate(opts: CliOptions, log: JsonLogger): Promise<GenerateResu
     await log.info("cache.miss", { key });
   }
 
-  // lock to prevent concurrent codex exec
-  const lockDir = opts.cacheDir ?? path.join(homedir(), ".cache", "baoyu-codex-imagegen");
-  const lock = new FileLock(path.join(lockDir, "codex-exec.lock"));
-  try {
-    await lock.acquire(60_000);
-  } catch (e) {
-    throw new GenError("lock_busy", String(e), false);
-  }
-
   await mkdir(path.dirname(opts.outputPath), { recursive: true });
   const instruction = buildInstruction(prompt, opts);
 
   let lastErr: GenError | null = null;
   let lastAttempt = 0;
-  try {
-    for (let attempt = 1; attempt <= opts.retries + 1; attempt++) {
-      lastAttempt = attempt;
-      try {
-        const result = await attemptGenerate(opts, instruction, attempt, log);
+  for (let attempt = 1; attempt <= opts.retries + 1; attempt++) {
+    lastAttempt = attempt;
+    try {
+      const result = await attemptGenerate(opts, instruction, attempt, log);
 
-        // write to cache
-        if (opts.cacheDir) {
-          const key = cacheKey(prompt, opts.aspect, opts.refImages);
-          await storeCache(opts.cacheDir, key, opts.outputPath);
-          await log.info("cache.stored", { key });
-        }
-
-        return {
-          status: "ok",
-          path: opts.outputPath,
-          bytes: result.bytes,
-          elapsed_seconds: Math.round((Date.now() - startEpoch) / 1000),
-          thread_id: result.threadId,
-          attempts: attempt,
-          cached: false,
-          usage: result.usage,
-          tool_calls: result.toolCalls,
-        };
-      } catch (e) {
-        lastErr = e instanceof GenError ? e : new GenError("spawn_failed", String(e));
-        await log.warn("attempt.failed", {
-          attempt,
-          kind: lastErr.kind,
-          retryable: lastErr.retryable,
-          error: lastErr.message,
-        });
-        if (!lastErr.retryable || attempt > opts.retries) break;
-        const wait = opts.retryDelayMs * Math.pow(2, attempt - 1);
-        await log.info("retry.wait", { wait_ms: wait, next_attempt: attempt + 1 });
-        await delay(wait);
+      // write to cache
+      if (opts.cacheDir) {
+        const key = cacheKey(prompt, opts.aspect, opts.refImages);
+        await storeCache(opts.cacheDir, key, opts.outputPath);
+        await log.info("cache.stored", { key });
       }
+
+      return {
+        status: "ok",
+        path: opts.outputPath,
+        bytes: result.bytes,
+        elapsed_seconds: Math.round((Date.now() - startEpoch) / 1000),
+        thread_id: result.threadId,
+        attempts: attempt,
+        cached: false,
+        usage: result.usage,
+        tool_calls: result.toolCalls,
+      };
+    } catch (e) {
+      lastErr = e instanceof GenError ? e : new GenError("spawn_failed", String(e));
+      await log.warn("attempt.failed", {
+        attempt,
+        kind: lastErr.kind,
+        retryable: lastErr.retryable,
+        error: lastErr.message,
+      });
+      if (!lastErr.retryable || attempt > opts.retries) break;
+      const wait = opts.retryDelayMs * Math.pow(2, attempt - 1);
+      await log.info("retry.wait", { wait_ms: wait, next_attempt: attempt + 1 });
+      await delay(wait);
     }
-  } finally {
-    await lock.release();
   }
 
   const err = lastErr ?? new GenError("spawn_failed", "Unknown failure");

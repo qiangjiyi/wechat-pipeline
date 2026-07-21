@@ -15,12 +15,14 @@
 ### 决策
 
 1. 把固定上游 commit 的 gzh-design 运行快照原样纳入 Plugin，不修改其 `SKILL.md`、references、scripts 或 assets。
-2. Formatter 后创建只读 `content.md`；Designer 和 Typesetter 共同读取它，不允许再向正文插入或改名图片引用。
+2. Formatter 后创建只读 `content.md`；自 protocol `2026-07-18-002` 起，文章配图 Skill 在隔离副本中自然插入图片引用，Typesetter 消费其返回的最终文章，canonical `content.md` 仍保持只读。
 3. 新增独立 Typesetter worker，在 Designer 与 Publisher 之间原生执行 gzh-design。
 4. News Publisher 默认消费已验收的 `article-body.html`，不再在发布阶段二次渲染 Markdown。
 5. Publisher 只上传正文图片并替换 `img[src]`，保留 Typesetter 生成的其余 HTML。
 6. 旧 `baoyu-md` Markdown renderer 作为显式兼容路径保留，不允许在同一 run 中静默 fallback。
 7. 流水线调用 gzh-design 时采用 `preserve-visible-text` 内容策略：保留全部原文，不自动追加署名、CTA、观点或占位文案。
+8. 自 protocol `2026-07-18-006` 起，Typesetter 只在隔离 workspace 中自然调用 gzh-design 并返回最终干净 HTML。`layout.json`、canonical HTML、hash、固定 lock 绑定和验收回执全部由 `prepare_layout.py` 确定性生成；Agent 不再手写或修补这些集成产物。
+9. Pipeline 不验收 gzh-design 内部主题、组件、prompt、推理、辅助文件或自然文件名，只验收原生 Skill 调用边界、最终 HTML、原文与图片保留、禁止新增的作者/互动结尾以及发布绑定。
 
 ### 运行门禁
 
@@ -74,10 +76,52 @@
 2. Formatter、Designer、Typesetter、Publisher 只写各自拥有的内容产物。
 3. `content.md` 与 `publish-snapshot.json` 创建后只读。
 4. Typesetter 必须等待全部图片通过 artwork gate。
-5. 唯一允许的并行是同一 Designer 对不同图片进行 batch 调用；共享 manifest 最后单次汇总。
+5. 此条自 ADR-004 起由“视觉 Skill 自主管理内部并发”取代；Pipeline 不再拆分或重排单图生成任务。
 6. Publisher 必须验证 snapshot，发布回执必须绑定 snapshot hash 和 fingerprint。
 7. `run.json` 增加 revision 与 state checksum，拒绝直接状态编辑。
 
 ### 结果
 
 牺牲约 1–2 分钟的跨阶段重叠，换取可重放、可恢复且不可通过普通 Agent 操作绕过的发布链路。主要性能收益来自图片 batch，而不是让多个 Agent 同时写共享文件。
+
+## ADR-004：Pipeline 只编排原生 Skill，不编排 Skill 内部工作流
+
+- 状态：已采纳
+- 日期：2026-07-18
+- 适用版本：protocol 2026-07-18-002
+
+### 背景
+
+真实运行显示 Designer 绕过 `baoyu-cover-image` 和 `baoyu-article-illustrator`，自行写简化 prompt，再用 EXTEND 文件和宽松 manifest 模拟 Skill 已执行。旧的 planning/rendering 协议同时强制 prompt 位置、图片数量和 backend，迫使 Pipeline 重建原生 Skill 已经拥有的工作流。
+
+### 决策
+
+1. 合并 planning/rendering 为单一 `designing` 状态。
+2. Designer 只通过运行时原生机制调用模式对应的视觉 Skill，不生成替代 prompt 或图片。
+3. 每个 Skill 在运行根目录下独立的 `<invocation-id>/` 中完整执行自己的当前流程，不增加 `skill-output/` 包装层；具体输出子目录继续由该 Skill 的 `EXTEND.md` 决定。
+4. Pipeline 不校验 outline、prompt、references、视觉决策、图片密度或内部 backend。
+5. 控制面只绑定准确的 `SKILL.md`、输入、开始/完成状态和 Skill 明确返回的最终结果。
+6. News Typesetter 使用文章配图 Skill 返回的最终文章，保留其图片落位决定。
+
+### 结果
+
+Pipeline 成为薄编排层，视觉能力和工作流继续由可独立升级的原生 Skill 所有。目标 Skill 失败时流程停止，不再存在手工模拟 Skill 的降级路径。
+
+## ADR-005：统一 Skill 边界并并行隔离的视觉工作
+
+- 状态：已采纳
+- 日期：2026-07-19
+- 适用版本：wechat-pipeline 0.8.0 / protocol 2026-07-20-001
+
+### 决策
+
+1. Formatter、visual、layout 共用 `skill_run.py` 的 start/complete/fail/reset 生命周期，role 白名单由该脚本单源维护。
+2. complete 负责输出路径、hash、时间、role 数量与源文保真检查；错误消息必须附带可复制的完整命令。
+3. 失败恢复只能由 Leader reset 并记录事件；历史 role 纠正只能使用 `amend-role`。
+4. release/runtime 完整性合并，状态前进恢复运行时门禁；同一 run 用文件数、最新 mtime 与总大小跳过未变化的重复全树 hash，发布前和 published 强制重算。
+5. News 的封面和正文配图没有数据依赖，使用两个隔离 Worker 并行；二者完成后才构建唯一 manifest。
+6. 图片 batch 的显式 CLI provider 高于 task/EXTEND/环境默认，`codex-cli` 默认并发度为 2。
+
+### 结果
+
+契约错误、跨阶段返工和 Leader 手工救火被确定性边界前置拦截；主要墙钟由并行后的正文图片生成决定。首次真实运行仍需记录墙钟、hash 次数和 token，验证目标值而不是由代码测试推断。

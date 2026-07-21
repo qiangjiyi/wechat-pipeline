@@ -58,8 +58,7 @@ export type ErrorKind =
   | "no_image_gen_tool_use"
   | "output_missing"
   | "invalid_png"
-  | "agent_refused"
-  | "lock_busy";
+  | "agent_refused";
 
 export const RETRYABLE: ReadonlySet<ErrorKind> = new Set([
   "spawn_failed",

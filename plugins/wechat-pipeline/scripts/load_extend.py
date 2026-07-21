@@ -18,11 +18,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
 from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT))
+
+from shared.hashing import sha256_file
 
 
 # baoyu-image-gen was previously named baoyu-imagine. Its SKILL.md says the
@@ -55,14 +59,6 @@ def candidate_paths(skill: str, base_dir: Path) -> list[tuple[str, Path]]:
             ]
         )
     return candidates
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def resolve(skill: str, base_dir: Path) -> dict:

@@ -8,7 +8,7 @@ type CliArgs = {
   outputPath: string | null;
   imagesDir: string | null;
   refsDir: string;
-  provider: string;
+  provider: string | null;
   model: string | null;
   aspectRatio: string;
   quality: string;
@@ -37,7 +37,7 @@ Options:
   --output <path>      Path to output batch.json
   --images-dir <path>  Directory for generated images
   --refs-dir <path>    Directory holding reference images, relative to batch file (default: references)
-  --provider <name>    Provider for baoyu-image-gen batch tasks (default: replicate)
+  --provider <name>    Explicit provider for every task (default: omit; main CLI > EXTEND.md > environment detection)
   --model <id>         Explicit model for baoyu-image-gen batch tasks (default: resolved by baoyu-image-gen config/env)
   --ar <ratio>         Aspect ratio for all tasks (default: 16:9)
   --quality <level>    Quality for all tasks (default: 2k)
@@ -52,7 +52,7 @@ function parseArgs(argv: string[]): CliArgs {
     outputPath: null,
     imagesDir: null,
     refsDir: "references",
-    provider: "replicate",
+    provider: null,
     model: null,
     aspectRatio: "16:9",
     quality: "2k",
@@ -217,10 +217,10 @@ async function main(): Promise<void> {
       id: `illustration-${String(entry.index).padStart(2, "0")}`,
       promptFiles: [promptFile],
       image: path.join(imageDir, entry.filename),
-      provider: args.provider,
       ar: args.aspectRatio,
       quality: args.quality,
     };
+    if (args.provider) task.provider = args.provider;
     if (args.model) task.model = args.model;
     if (refs.length > 0) task.ref = refs;
     tasks.push(task);

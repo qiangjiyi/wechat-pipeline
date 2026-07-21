@@ -61,8 +61,8 @@ batch:
       concurrency: 3
       start_interval_ms: 1100
     codex-cli:
-      concurrency: 1
-      start_interval_ms: 2000
+      concurrency: 2
+      start_interval_ms: 1000
     agnes:
       concurrency: 3
       start_interval_ms: 1100

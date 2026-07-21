@@ -547,6 +547,18 @@ test("batch worker and provider-rate-limit configuration prefer env over EXTEND 
   });
 });
 
+test("codex-cli uses scheduler concurrency two without a process-global lock", async () => {
+  assert.deepEqual(getConfiguredProviderRateLimits({})["codex-cli"], {
+    concurrency: 2,
+    startIntervalMs: 1000,
+  });
+  const wrapper = await fs.readFile(
+    path.join(import.meta.dirname, "codex-imagegen", "main.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(wrapper, /FileLock|codex-exec\.lock/);
+});
+
 test("loadBatchTasks and createTaskArgs resolve batch-relative paths", async (t) => {
   const root = await makeTempDir("baoyu-image-gen-batch-");
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -598,6 +610,16 @@ test("loadBatchTasks and createTaskArgs resolve batch-relative paths", async (t)
   assert.equal(taskArgs.quality, "2k");
   assert.equal(taskArgs.imageApiDialect, "ratio-metadata");
   assert.equal(taskArgs.json, true);
+});
+
+test("main CLI provider overrides a conflicting per-task provider", () => {
+  const taskArgs = createTaskArgs(
+    makeArgs({ provider: "codex-cli", providerSource: "cli" }),
+    { id: "one", prompt: "demo", image: "one.png", provider: "replicate" },
+    "/tmp/batch",
+  );
+  assert.equal(taskArgs.provider, "codex-cli");
+  assert.equal(taskArgs.providerSource, "cli");
 });
 
 test("path normalization, worker count, and retry classification follow expected rules", () => {

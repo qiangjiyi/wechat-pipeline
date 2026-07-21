@@ -20,6 +20,7 @@ export type CliArgs = {
   promptFiles: string[];
   imagePath: string | null;
   provider: Provider | null;
+  providerSource?: "cli" | "config" | null;
   model: string | null;
   aspectRatio: string | null;
   aspectRatioSource?: "cli" | "task" | "config" | null;

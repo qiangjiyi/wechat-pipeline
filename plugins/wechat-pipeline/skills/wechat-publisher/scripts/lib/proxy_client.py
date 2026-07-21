@@ -157,8 +157,6 @@ def upload_image_direct(api_base: str, token: str, image: Path) -> str:
         return _read_json_response(req, timeout=60)
 
     data = _with_network_retry(operation)
-    if data.get("errcode"):
-        raise PublishError(f"WeChat error {data.get('errcode')}: {data.get('errmsg')}")
     media_id = data.get("media_id")
     if not media_id:
         raise PublishError(f"media_id missing for {image}: {data}")
@@ -218,8 +216,6 @@ def upload_body_image_direct(api_base: str, token: str, image: Path) -> str:
         return _read_json_response(req, timeout=60)
 
     data = _with_network_retry(operation)
-    if data.get("errcode") and data.get("errcode") != 0:
-        raise PublishError(f"WeChat error {data.get('errcode')}: {data.get('errmsg')}")
     url_field = data.get("url")
     if not url_field:
         raise PublishError(f"uploadimg returned no url for {image}: {data}")

@@ -19,6 +19,8 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 from protocol_version import PROTOCOL_VERSION
 from shared.dotenv import load_dotenv
+from shared.hashing import sha256_file
+from shared.jsonio import load_json, now_iso, write_json
 
 try:
     import fcntl
@@ -40,9 +42,8 @@ COMMON_STATUS_TRANSITIONS = {
     "awaiting_input": {"input_sealed", "failed", "cancelled"},  # legacy recovery only
     "input_sealed": {"formatting", "failed", "cancelled"},
     "formatting": {"content_ready", "failed", "cancelled"},
-    "content_ready": {"planning", "failed", "cancelled"},
-    "planning": {"rendering", "failed", "cancelled"},
-    "rendering": {"artwork_ready", "failed", "cancelled"},
+    "content_ready": {"designing", "failed", "cancelled"},
+    "designing": {"artwork_ready", "failed", "cancelled"},
     "publish_ready": {"publishing", "failed", "cancelled"},
     "publishing": {"published", "failed", "cancelled"},
     "failed": set(),
@@ -63,13 +64,67 @@ MODE_STATUS_TRANSITIONS = {
     },
 }
 
+EXPECTED_WORKER_STATUS = {
+    "formatter": "formatting",
+    "designer": "designing",
+    "typesetter": "typesetting",
+    "publisher": "publishing",
+}
+ALLOWED_ACTORS = {
+    "wechat-leader",
+    "wechat-formatter",
+    "wechat-designer",
+    "wechat-typesetter",
+    "wechat-publisher",
+}
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+HOST_RUNTIMES = ("claude-code", "codex")
+
+
+def detect_host_runtime() -> str:
+    """Best-effort host detection from environment markers."""
+    if os.environ.get("CLAUDECODE"):
+        return "claude-code"
+    return "unknown"
+
+
+def validate_host_runtime(declared: str) -> str:
+    """Fail closed when the declared host runtime contradicts the environment.
+
+    The pipeline's worker dispatch and native Skill invocation only work on
+    hosts that can spawn pipeline subagents; a chat bridge that merely relays
+    prompts must not silently degrade into a single-agent run.
+    """
+    if declared not in HOST_RUNTIMES:
+        raise SystemExit(
+            f"--host-runtime must be one of {list(HOST_RUNTIMES)}, got {declared!r}; "
+            "declare the runtime that actually executes this run"
+        )
+    detected = detect_host_runtime()
+    if declared == "claude-code" and detected != "claude-code":
+        raise SystemExit(
+            "--host-runtime claude-code requires the CLAUDECODE environment marker; "
+            "this shell is not a Claude Code session"
+        )
+    if declared == "codex" and detected == "claude-code":
+        raise SystemExit(
+            "--host-runtime codex contradicts the CLAUDECODE environment marker; "
+            "declare claude-code instead"
+        )
+    return declared
+
+
+def check_run_host_runtime(data: dict) -> str | None:
+    """Return an error when the current shell contradicts the run's host runtime."""
+    declared = str(data.get("host_runtime", ""))
+    if declared not in HOST_RUNTIMES:
+        return f"run.json host_runtime must be one of {list(HOST_RUNTIMES)}"
+    detected = detect_host_runtime()
+    if declared == "claude-code" and detected != "claude-code":
+        return "run was created for claude-code but CLAUDECODE is not set"
+    if declared == "codex" and detected == "claude-code":
+        return "run was created for codex but this shell is a Claude Code session"
+    return None
 
 
 def state_checksum(data: dict) -> str:
@@ -78,6 +133,7 @@ def state_checksum(data: dict) -> str:
         for key in (
             "protocol_version", "run_id", "mode", "account", "canonical_output_dir",
             "input_path", "source_sha256", "status", "failed_from", "revision",
+            "host_runtime",
         )
     }
     encoded = json.dumps(protected, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -93,19 +149,32 @@ def slugify(value: str) -> str:
     return slug
 
 
-def load_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+def normalize_run_slug(value: str) -> str:
+    """Keep the semantic slug while run_id remains the sole uniqueness suffix."""
+    slug = slugify(value)
+    slug = re.sub(r"(?:^|-)\d{8}-\d{6}$", "", slug).strip("-")
+    return slug or "article"
 
 
-def write_json(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    temp.chmod(0o600)
-    os.replace(temp, path)
+OBSIDIAN_IMAGE_EMBED = re.compile(
+    r"!\[\[\s*([^\[\]|]*?\.(?:png|jpe?g|gif|webp|bmp|heic|svg))(?:\|[^\[\]]*)?\]\]",
+    re.IGNORECASE,
+)
+LOCAL_IMAGE_REFERENCE = re.compile(
+    r"!\[[^\]]*\]\(\s*(?!https?://|data:|#)([^)\s]+)[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+def find_local_image_references(text: str) -> list[str]:
+    """List local image references the pipeline cannot carry into a WeChat draft."""
+    found: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for match in OBSIDIAN_IMAGE_EMBED.finditer(line):
+            found.append(f"第 {lineno} 行: ![[{match.group(1).strip()}]]")
+        for match in LOCAL_IMAGE_REFERENCE.finditer(line):
+            found.append(f"第 {lineno} 行: ![]({match.group(1)})")
+    return found
 
 
 def append_event(
@@ -120,8 +189,8 @@ def append_event(
         raise SystemExit("run event logging requires a Unix-like host")
     if not re.fullmatch(r"[a-z][a-z0-9_.-]*", event):
         raise SystemExit(f"invalid event name: {event!r}")
-    if not actor.strip():
-        raise SystemExit("event actor must not be empty")
+    if actor not in ALLOWED_ACTORS:
+        raise SystemExit(f"event actor must be one of {sorted(ALLOWED_ACTORS)}, got {actor!r}")
     pipeline_dir = run_dir / ".pipeline"
     record = {
         "schema_version": 1,
@@ -130,7 +199,7 @@ def append_event(
         "event_id": secrets.token_hex(8),
         "event": event,
         "actor": actor,
-        "occurred_at": datetime.now().astimezone().isoformat(),
+        "occurred_at": now_iso(),
         "details": details or {},
     }
     events_path = pipeline_dir / "events.jsonl"
@@ -188,11 +257,50 @@ def validate_run_identity(run_dir: Path, data: dict) -> Path:
         raise SystemExit(f"run protocol_version must be {PROTOCOL_VERSION}")
     if data.get("state_checksum") != state_checksum(data):
         raise SystemExit("run.json state checksum mismatch; direct state edits are forbidden")
+    host_error = check_run_host_runtime(data)
+    if host_error:
+        raise SystemExit(host_error)
     input_path = Path(str(data.get("input_path", ""))).expanduser().resolve()
     expected_input = run_dir / ".pipeline" / "input.md"
     if input_path != expected_input:
         raise SystemExit("run.json input_path must point to the canonical .pipeline/input.md")
     return input_path
+
+
+def validate_worker_stage(
+    run_dir: Path,
+    worker: str,
+    *,
+    check_integrity: bool = True,
+) -> list[str]:
+    """Fail closed unless a Worker is entering its exact authorized stage."""
+    errors: list[str] = []
+    try:
+        run = load_json(run_dir / ".pipeline" / "run.json")
+        validate_run_identity(run_dir, run)
+    except (OSError, ValueError, json.JSONDecodeError, SystemExit) as err:
+        return [f"unable to validate run identity: {err}"]
+    expected = EXPECTED_WORKER_STATUS[worker]
+    if run.get("status") != expected:
+        errors.append(f"{worker} requires run status {expected}, got {run.get('status')!r}")
+    if check_integrity:
+        from integrity import validate_runtime
+
+        runtime_errors, _ = validate_runtime(run_dir, run)
+        errors.extend(runtime_errors)
+    return errors
+
+
+def guard_worker(args: argparse.Namespace) -> int:
+    run_dir = args.run_dir.expanduser().resolve()
+    errors = validate_worker_stage(run_dir, args.worker)
+    if errors:
+        print("stage guard failed:")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+    print(json.dumps({"ok": True, "worker": args.worker, "status": EXPECTED_WORKER_STATUS[args.worker]}))
+    return 0
 
 
 def iter_runs(exports_root: Path):
@@ -211,7 +319,7 @@ def find_reusable_run(
 ) -> Path | None:
     if not source_sha256:
         return None
-    from runtime_integrity import validate as validate_runtime
+    from integrity import validate_runtime
 
     candidates: list[tuple[str, Path]] = []
     for path, data in iter_runs(exports_root):
@@ -232,6 +340,7 @@ def find_reusable_run(
 def init_run(args: argparse.Namespace) -> int:
     exports_root = args.exports_root.expanduser().resolve()
     source = args.source.expanduser().resolve()
+    host_runtime = validate_host_runtime(args.host_runtime)
     if not source.is_file():
         raise SystemExit(f"source file not found: {source}")
     if source.stat().st_size == 0:
@@ -244,10 +353,22 @@ def init_run(args: argparse.Namespace) -> int:
             print(json.dumps({"reused": True, "run_dir": str(reusable)}, ensure_ascii=False))
             return 0
 
+        references = find_local_image_references(
+            source.read_text(encoding="utf-8", errors="replace")
+        )
+        if references:
+            listed = "\n".join(f"- {item}" for item in references[:10])
+            raise SystemExit(
+                "源文包含本地图片引用，发布流水线无法携带（正文图片由 Designer 统一生成并受 "
+                "manifest 约束，本地图片只会变成占位文字或被静默丢弃）：\n"
+                f"{listed}\n"
+                "请先删除这些图片行或改写为文字说明，再重新发起。"
+            )
+
         now = datetime.now().astimezone()
         run_id = f"{now:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
-        parent = "image-cards" if args.mode == "newspic" else "wechat-articles"
-        run_dir = exports_root / parent / f"{slugify(args.slug)}-{run_id}"
+        parent = "image-cards" if args.mode == "newspic" else "wechat-pipeline"
+        run_dir = exports_root / parent / f"{normalize_run_slug(args.slug)}-{run_id}"
         pipeline_dir = run_dir / ".pipeline"
         pipeline_dir.mkdir(parents=True, exist_ok=False)
         run_dir.chmod(0o700)
@@ -262,6 +383,7 @@ def init_run(args: argparse.Namespace) -> int:
             "run_id": run_id,
             "mode": args.mode,
             "account": args.account,
+            "host_runtime": host_runtime,
             "canonical_output_dir": str(run_dir),
             "input_path": str(input_path),
             "source_sha256": source_hash,
@@ -272,15 +394,31 @@ def init_run(args: argparse.Namespace) -> int:
         }
         data["state_checksum"] = state_checksum(data)
         write_json(pipeline_dir / "run.json", data)
-        from runtime_integrity import capture as capture_runtime
+        from integrity import capture_runtime
+        from preflight_image_backends import probe_image_backends
 
         capture_runtime(run_dir, data)
+        write_json(
+            pipeline_dir / "backends.json",
+            {
+                "schema_version": 1,
+                "protocol_version": PROTOCOL_VERSION,
+                "run_id": run_id,
+                "probed_at": now_iso(),
+                **probe_image_backends(),
+            },
+        )
         append_event(
             run_dir,
             data,
             "run.created",
             "wechat-leader",
-            {"status": data["status"], "mode": args.mode, "account": args.account},
+            {
+                "status": data["status"],
+                "mode": args.mode,
+                "account": args.account,
+                "host_runtime": host_runtime,
+            },
         )
     print(json.dumps({"reused": False, "run_dir": str(run_dir), **data}, ensure_ascii=False))
     return 0
@@ -291,24 +429,25 @@ def seal_run(args: argparse.Namespace) -> int:
         raise SystemExit("run input may only be sealed by actor wechat-leader")
     run_dir = args.run_dir.expanduser().resolve()
     run_path = run_dir / ".pipeline" / "run.json"
-    data = load_json(run_path)
-    input_path = validate_run_identity(run_dir, data)
-    current = str(data.get("status", ""))
-    if current not in {"awaiting_input", "input_sealed"}:
-        raise SystemExit(f"cannot seal run while status is {current!r}")
-    if not input_path.is_file() or input_path.stat().st_size == 0:
-        raise SystemExit(f"run input is missing or empty: {input_path}")
-    source_hash = sha256_file(input_path)
-    existing = data.get("source_sha256")
-    if existing and existing != source_hash:
-        raise SystemExit("sealed run input changed; create a new run instead")
-    input_path.chmod(0o400)
-    data["source_sha256"] = source_hash
-    data["status"] = "input_sealed"
-    data["updated_at"] = datetime.now().astimezone().isoformat()
-    data["state_checksum"] = state_checksum(data)
-    write_json(run_path, data)
-    append_event(run_dir, data, "input.sealed", args.actor, {"source_sha256": source_hash})
+    with run_lock(run_dir):
+        data = load_json(run_path)
+        input_path = validate_run_identity(run_dir, data)
+        current = str(data.get("status", ""))
+        if current not in {"awaiting_input", "input_sealed"}:
+            raise SystemExit(f"cannot seal run while status is {current!r}")
+        if not input_path.is_file() or input_path.stat().st_size == 0:
+            raise SystemExit(f"run input is missing or empty: {input_path}")
+        source_hash = sha256_file(input_path)
+        existing = data.get("source_sha256")
+        if existing and existing != source_hash:
+            raise SystemExit("sealed run input changed; create a new run instead")
+        input_path.chmod(0o400)
+        data["source_sha256"] = source_hash
+        data["status"] = "input_sealed"
+        data["updated_at"] = now_iso()
+        data["state_checksum"] = state_checksum(data)
+        write_json(run_path, data)
+        append_event(run_dir, data, "input.sealed", args.actor, {"source_sha256": source_hash})
     print(json.dumps(data, ensure_ascii=False))
     return 0
 
@@ -342,7 +481,7 @@ def set_status(args: argparse.Namespace) -> int:
         previous = current
         data["status"] = args.status
         data["revision"] = int(data.get("revision", 0)) + (args.status != previous)
-        data["updated_at"] = datetime.now().astimezone().isoformat()
+        data["updated_at"] = now_iso()
         data["state_checksum"] = state_checksum(data)
         write_json(run_path, data)
         if args.status != previous:
@@ -360,29 +499,32 @@ def set_status(args: argparse.Namespace) -> int:
 def validate_transition_gate(run_dir: Path, data: dict, target: str) -> None:
     """Run the deterministic gate required to enter one target state."""
     if target not in {"failed", "cancelled"}:
-        from runtime_integrity import validate as validate_runtime
+        from integrity import validate_runtime
 
-        errors, _ = validate_runtime(run_dir, data)
+        errors, _ = validate_runtime(
+            run_dir,
+            data,
+            force=target in {"publish_ready", "published"},
+        )
         if errors:
             raise SystemExit("runtime integrity gate failed: " + "; ".join(errors))
     if target == "content_ready":
         from prepare_content import validate_content_artifact
 
         errors, _ = validate_content_artifact(run_dir)
-    elif target == "rendering":
-        from validate_designer_manifest import validate
-
-        errors = validate(run_dir / ".pipeline" / "manifest.json", "plan")
     elif target == "artwork_ready":
         from validate_designer_manifest import validate
 
-        errors = validate(run_dir / ".pipeline" / "manifest.json", "publish-ready")
+        errors = validate(run_dir / ".pipeline" / "manifest.json")
     elif target == "layout_ready":
-        from validate_article_layout import validate
+        from prepare_layout import validate_layout_evidence
 
-        result = validate(run_dir / "article-body.html", run_dir / ".pipeline" / "layout.json")
-        errors = list(result.get("errors", [])) + list(result.get("warnings", []))
-    elif target in {"publish_ready", "publishing"}:
+        errors, _ = validate_layout_evidence(run_dir)
+    elif target == "publish_ready":
+        from build_publish_snapshot import validate_snapshot_evidence
+
+        errors, _ = validate_snapshot_evidence(run_dir)
+    elif target == "publishing":
         from build_publish_snapshot import validate_snapshot
 
         errors, _ = validate_snapshot(run_dir)
@@ -423,7 +565,7 @@ def update_progress(args: argparse.Namespace) -> int:
         raise SystemExit("progress requires 0 <= completed <= total")
     allowed_statuses = {
         "wechat-formatter": {"formatting"},
-        "wechat-designer": {"planning", "rendering"},
+        "wechat-designer": {"designing"},
         "wechat-typesetter": {"typesetting"},
         "wechat-publisher": {"publishing"},
     }
@@ -441,7 +583,7 @@ def update_progress(args: argparse.Namespace) -> int:
         "completed": args.completed,
         "total": args.total,
         "message": args.message or "",
-        "updated_at": datetime.now().astimezone().isoformat(),
+        "updated_at": now_iso(),
     }
     write_json(run_dir / ".pipeline" / "progress.json", payload)
     append_event(
@@ -468,6 +610,7 @@ def main() -> int:
     init_parser.add_argument("--account", required=True)
     init_parser.add_argument("--slug", required=True)
     init_parser.add_argument("--source", type=Path, required=True)
+    init_parser.add_argument("--host-runtime", choices=HOST_RUNTIMES, required=True)
     init_parser.add_argument("--exports-root", type=Path, default=default_exports_root())
     init_parser.add_argument("--force-new", action="store_true")
     init_parser.set_defaults(func=init_run)
@@ -481,7 +624,7 @@ def main() -> int:
     status_parser.add_argument("run_dir", type=Path)
     status_parser.add_argument(
         "status",
-        choices=("awaiting_input", "input_sealed", "formatting", "content_ready", "planning", "rendering", "artwork_ready", "typesetting", "layout_ready", "publish_ready", "publishing", "published", "failed", "cancelled"),
+        choices=("awaiting_input", "input_sealed", "formatting", "content_ready", "designing", "artwork_ready", "typesetting", "layout_ready", "publish_ready", "publishing", "published", "failed", "cancelled"),
     )
     status_parser.add_argument("--actor", required=True)
     status_parser.set_defaults(func=set_status)
@@ -501,6 +644,11 @@ def main() -> int:
     progress_parser.add_argument("--total", required=True, type=int)
     progress_parser.add_argument("--message")
     progress_parser.set_defaults(func=update_progress)
+
+    guard_parser = subparsers.add_parser("guard")
+    guard_parser.add_argument("run_dir", type=Path)
+    guard_parser.add_argument("worker", choices=tuple(EXPECTED_WORKER_STATUS))
+    guard_parser.set_defaults(func=guard_worker)
 
     args = parser.parse_args()
     return args.func(args)

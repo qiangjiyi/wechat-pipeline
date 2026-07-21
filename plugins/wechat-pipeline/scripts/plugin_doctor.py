@@ -4,11 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
+import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -17,12 +16,88 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from shared.dotenv import load_dotenv
-from shared.file_utils import is_relevant_file
-from run_context import default_exports_root
+from integrity import validate_release
+from run_context import detect_host_runtime
 
 
 DEFAULT_CONFIG = Path("~/.config/wechat-pipeline/.env").expanduser()
 ENV_TEMPLATE = PLUGIN_ROOT / "skills" / "wechat-publisher" / ".env.example"
+
+BAOYU_ENV = Path("~/.baoyu-skills/.env").expanduser()
+BAOYU_EXTEND = Path("~/.baoyu-skills/baoyu-image-gen/EXTEND.md").expanduser()
+IMAGE_GEN_DIALECTS = {"openai-native", "ratio-metadata"}
+
+
+def upstream_dialect(raw: str) -> str | None:
+    """Mirror baoyu-image-gen parseOpenAIImageApiDialect (strips quotes, not comments)."""
+    value = raw.replace("'", "").replace('"', "").strip()
+    if not value or value == "null":
+        return None
+    if value in IMAGE_GEN_DIALECTS:
+        return value
+    raise ValueError(raw.strip())
+
+
+def extend_dialect(extend_path: Path) -> tuple[str | None, str | None]:
+    """Return (dialect, error) from the EXTEND.md frontmatter dialect key."""
+    if not extend_path.is_file():
+        return None, None
+    text = extend_path.read_text(encoding="utf-8", errors="replace")
+    match = re.match(r"^---\s*\n([\s\S]*?)\n---\s*$", text)
+    if not match:
+        return None, None
+    for lineno, line in enumerate(match.group(1).splitlines(), 2):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        if key.strip() != "default_image_api_dialect":
+            continue
+        try:
+            return upstream_dialect(value), None
+        except ValueError:
+            return None, (
+                f"{extend_path}:{lineno} default_image_api_dialect 的值 {value.strip()!r} "
+                "不合法（合法值：openai-native | ratio-metadata；上游不会剥离行内注释，"
+                "注释请写成独立行）"
+            )
+    return None, None
+
+
+def image_gen_dialect_errors(
+    env_path: Path = BAOYU_ENV,
+    extend_path: Path = BAOYU_EXTEND,
+) -> list[str]:
+    """Fail fast on baoyu-image-gen dialect config its own loader would reject.
+
+    The vendored image skill keeps inline comments in values and then aborts
+    deep inside a Designer worker; resolve the same CLI > EXTEND.md > env
+    chain here so bad config surfaces before a run is created.
+    """
+    dialect, error = extend_dialect(extend_path)
+    if error:
+        return [error]
+    if dialect or not env_path.is_file():
+        return []
+    errors: list[str] = []
+    for lineno, raw_line in enumerate(
+        env_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != "OPENAI_IMAGE_API_DIALECT":
+            continue
+        try:
+            upstream_dialect(value)
+        except ValueError:
+            errors.append(
+                f"{env_path}:{lineno} OPENAI_IMAGE_API_DIALECT 的值 {value.strip()!r} "
+                "不合法（合法值：openai-native | ratio-metadata；上游不会剥离行内注释，"
+                "注释请写成独立行）"
+            )
+    return errors
 
 
 def normalize_account(value: str) -> str:
@@ -58,78 +133,17 @@ def account_ready(values: dict[str, str], account: str) -> bool:
     return bool(token or (app_id and secret))
 
 
-def image_backends() -> tuple[list[str], str | None]:
-    command = [sys.executable, str(PLUGIN_ROOT / "scripts" / "preflight_image_backends.py")]
-    result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=20)
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return [], result.stderr.strip() or "image backend preflight returned invalid output"
-    return data.get("fallback_order", []), None
-
-
-def tree_sha256(root: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(
-        path for path in root.rglob("*")
-        if path.is_file() and is_relevant_file(path)
-    ):
-        relative = path.relative_to(root).as_posix().encode()
-        contents = path.read_bytes()
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(len(contents).to_bytes(8, "big"))
-        digest.update(contents)
-    return digest.hexdigest()
-
-
-def validate_gzh_snapshot() -> str | None:
-    skill_root = PLUGIN_ROOT / "skills" / "gzh-design"
-    lock_path = PLUGIN_ROOT / "third_party" / "gzh-design.lock.json"
-    try:
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as err:
-        return f"unable to read bundled gzh-design lock: {err}"
-    required = [
-        skill_root / "SKILL.md",
-        skill_root / "references" / "theme-index.md",
-        skill_root / "references" / "common-components.md",
-        skill_root / "scripts" / "validate_gzh_html.py",
-    ]
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing:
-        return "bundled gzh-design runtime is incomplete: " + ", ".join(missing)
-    actual = tree_sha256(skill_root)
-    if actual != lock.get("tree_sha256"):
-        return "bundled gzh-design runtime hash does not match its lock"
-    return None
-
-
-def validate_baoyu_snapshots() -> list[str]:
-    lock_path = PLUGIN_ROOT / "third_party" / "baoyu-skills.lock.json"
-    try:
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as err:
-        return [f"unable to read bundled Baoyu lock: {err}"]
-    errors: list[str] = []
-    for name, metadata in (lock.get("skills") or {}).items():
-        skill_root = PLUGIN_ROOT / "skills" / name
-        if not skill_root.is_dir():
-            errors.append(f"bundled Baoyu Skill is missing: {name}")
-            continue
-        actual = tree_sha256(skill_root)
-        if actual != metadata.get("tree_sha256"):
-            errors.append(f"bundled Baoyu Skill hash does not match its lock: {name}")
-    return errors
-
-
 def doctor(args: argparse.Namespace) -> int:
     config_path = resolve_env_file(args.env_file)
     file_values = load_dotenv(config_path)
     values = {**file_values, **{key: value for key, value in os.environ.items() if value}}
     errors: list[str] = []
     warnings: list[str] = []
+    info: list[str] = []
 
+    release_errors, _ = validate_release()
+    errors.extend(release_errors)
+    errors.extend(image_gen_dialect_errors())
     if sys.version_info < (3, 10):
         errors.append("Python 3.10 or newer is required")
     if not config_path.is_file():
@@ -147,27 +161,16 @@ def doctor(args: argparse.Namespace) -> int:
     ):
         errors.append("no WeChat account is configured")
 
-    backends, backend_error = image_backends()
-    if backend_error:
-        errors.append(backend_error)
-    elif not backends:
-        errors.append("no image backend is configured")
-
-    if args.mode == "news":
-        gzh_error = validate_gzh_snapshot()
-        if gzh_error:
-            errors.append(gzh_error)
-    errors.extend(validate_baoyu_snapshots())
-
-    # Check exports directory alignment with global workspace convention
     exports_root = Path(
         values.get("WECHAT_PIPELINE_EXPORTS_DIR", "~/Workspace/exports")
     ).expanduser().resolve()
-    expected_exports_root = Path("~/Workspace/exports").expanduser().resolve()
-    if exports_root != expected_exports_root:
+    info.append(f"pipeline exports directory: {exports_root}")
+
+    host_runtime = detect_host_runtime()
+    if host_runtime == "unknown":
         warnings.append(
-            f"exports_dir does not match global workspace convention; expected {expected_exports_root}, got {exports_root}; "
-            "set WECHAT_PIPELINE_EXPORTS_DIR=$HOME/Workspace/exports in ~/.config/wechat-pipeline/.env to align"
+            "host runtime is not recognized (no CLAUDECODE marker); runs require an "
+            "explicit --host-runtime declaration and a host that can dispatch workers"
         )
 
     result = {
@@ -175,6 +178,7 @@ def doctor(args: argparse.Namespace) -> int:
         "plugin_root": str(PLUGIN_ROOT),
         "python_executable": sys.executable,
         "python_version": ".".join(str(part) for part in sys.version_info[:3]),
+        "host_runtime_detected": host_runtime,
         "config_file": str(config_path),
         "config_file_exists": config_path.is_file(),
         "exports_root": str(
@@ -184,10 +188,11 @@ def doctor(args: argparse.Namespace) -> int:
         ),
         "requested_account": args.account,
         "configured_accounts": accounts,
-        "image_backends": backends,
+        "image_backends": "resolved-by-native-skill",
         "mode": args.mode,
         "errors": errors,
         "warnings": warnings,
+        "info": info,
     }
     payload = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.output:

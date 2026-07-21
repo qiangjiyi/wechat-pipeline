@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -66,11 +67,14 @@ class PluginStructureTests(unittest.TestCase):
             data = frontmatter(path)
             found.add(data["name"])
             self.assertTrue(data.get("description"))
-            self.assertEqual(data.get("background"), "false")
             if data["name"] == "wechat-leader":
-                self.assertEqual(data.get("disallowedTools"), "Skill")
+                self.assertEqual(data.get("tools"), "Agent, Bash, Read")
+            elif data["name"] == "wechat-publisher":
+                self.assertEqual(data.get("tools"), "Bash, Read")
             else:
-                self.assertEqual(data.get("disallowedTools"), "Agent")
+                self.assertEqual(data.get("tools"), "Bash, Read, Write, Edit, Skill")
+            self.assertNotIn("background", data)
+            self.assertNotIn("disallowedTools", data)
         self.assertEqual(found, expected)
         self.assertFalse((ROOT / ".claude" / "agents").exists())
 
@@ -93,7 +97,10 @@ class PluginStructureTests(unittest.TestCase):
         self.assertEqual(found, expected)
         coordinator = (ROOT / "skills" / "wechat-pipeline" / "SKILL.md").read_text()
         self.assertIn("wechat-pipeline:wechat-leader", coordinator)
-        self.assertIn("Use Codex subagent tools", coordinator)
+        self.assertIn("使用宿主 subagent 工具派发所需 Worker", coordinator)
+        self.assertIn("HOST_RUNTIME=claude-code", coordinator)
+        self.assertIn("HOST_RUNTIME=codex", coordinator)
+        self.assertIn("任一能力不可用时直接返回 `blocked`", coordinator)
         self.assertIn("wechat-pipeline:baoyu-xhs-images", coordinator)
         self.assertIn("wechat-pipeline:gzh-design", coordinator)
 
@@ -105,19 +112,107 @@ class PluginStructureTests(unittest.TestCase):
         runtime_prompts = [
             ROOT / "docs" / "wechat-pipeline-protocol.md",
             ROOT / "skills" / "wechat-pipeline" / "SKILL.md",
+            ROOT / "skills" / "wechat-publisher" / "SKILL.md",
             *(ROOT / "agents").glob("*.md"),
         ]
         for path in runtime_prompts:
             text = path.read_text(encoding="utf-8")
             self.assertIn(version, text, str(path))
             self.assertNotRegex(text, r"2026-07-11-00(?!2)\d", str(path))
+        occurrences = sum(
+            path.read_text(encoding="utf-8").count(version) for path in runtime_prompts
+        )
+        self.assertEqual(occurrences, 9)
 
         protocol = (ROOT / "docs" / "wechat-pipeline-protocol.md").read_text(encoding="utf-8")
         self.assertIn("input_sealed", protocol)
         self.assertIn("formatting", protocol)
         self.assertIn("content_ready", protocol)
+        self.assertIn("designing", protocol)
         self.assertIn("artwork_ready", protocol)
         self.assertIn("publish_ready", protocol)
+        self.assertNotRegex(protocol, r"content_ready\s*→\s*planning")
+
+    def test_publish_snapshot_enforces_runtime_integrity(self) -> None:
+        snapshot_builder = (
+            ROOT / "scripts" / "build_publish_snapshot.py"
+        ).read_text(encoding="utf-8")
+        self.assertGreaterEqual(snapshot_builder.count("errors.extend(runtime_errors)"), 2)
+        self.assertNotIn("Skip runtime integrity", snapshot_builder)
+        run_context = (ROOT / "scripts" / "run_context.py").read_text(encoding="utf-8")
+        self.assertIn('raise SystemExit("runtime integrity gate failed:', run_context)
+        self.assertIn('force=target in {"publish_ready", "published"}', run_context)
+
+    def test_visual_orchestration_delegates_complete_native_skills(self) -> None:
+        designer = (ROOT / "agents" / "wechat-designer.md").read_text(encoding="utf-8")
+        leader = (ROOT / "agents" / "wechat-leader.md").read_text(encoding="utf-8")
+        coordinator = (ROOT / "skills" / "wechat-pipeline" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        protocol = (ROOT / "docs" / "wechat-pipeline-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        for skill in ("baoyu-xhs-images", "baoyu-cover-image", "baoyu-article-illustrator"):
+            self.assertIn(f"--invocation-id {skill}", designer)
+        self.assertIn("一次 Worker 只接受一份", designer)
+        self.assertIn("不得自创 outline、prompt", designer)
+        self.assertIn("不运行 start/build-manifest", designer)
+        self.assertIn("--boundary visual start", leader)
+        self.assertIn("--boundary visual build-manifest", leader)
+        self.assertIn('--host-runtime "$HOST_RUNTIME"', leader)
+        self.assertIn("不得由 Leader 手写 Markdown、prompt、图片、HTML、manifest 或回执", leader)
+        self.assertIn('fork_turns: "none"', leader)
+        self.assertIn("同时派两个", leader)
+        self.assertIn("没有先后依赖", leader)
+        self.assertIn("news 最终封面是否满足 `2.35:1`", protocol)
+        self.assertIn("缓存的 backend 能力事实", designer)
+        self.assertIn("每 5 秒一次", designer)
+        self.assertIn("illustrator 改写原文会当场拒收", protocol)
+        self.assertEqual(designer.count("--evidence"), 3)
+        self.assertIn('"schema_version": 1', designer)
+        self.assertIn("非空提示词", designer)
+        self.assertIn("执行证据", protocol)
+        self.assertIn("每个原生视觉 Skill", coordinator)
+        self.assertIn("具体分析、图片数量、风格、配色、构图", coordinator)
+        self.assertNotIn("wechat-pipeline:baoyu-image-gen`", coordinator)
+
+    def test_formatter_self_checks_and_leader_never_repairs_markdown(self) -> None:
+        formatter = (ROOT / "agents" / "wechat-formatter.md").read_text(encoding="utf-8")
+        leader = (ROOT / "agents" / "wechat-leader.md").read_text(encoding="utf-8")
+        protocol = (ROOT / "docs" / "wechat-pipeline-protocol.md").read_text(encoding="utf-8")
+        self.assertIn("--check-only", formatter)
+        self.assertIn("--invocation-id baoyu-format-markdown", formatter)
+        self.assertIn("--output \"formatted=", formatter)
+        self.assertIn("无条件派 Formatter", leader)
+        self.assertNotIn("结构已合格时跳过 Formatter", leader)
+        self.assertIn("每次完整 Pipeline 都必须原生执行一次", protocol)
+        self.assertIn("禁止把 `.pipeline/input.md` 作为候选", protocol)
+        self.assertTrue((ROOT / "scripts" / "skill_run.py").is_file())
+        self.assertFalse((ROOT / "scripts" / "formatter_skill_run.py").exists())
+        self.assertIn("--boundary formatter start", formatter)
+        self.assertIn("Pipeline 不规定 H2/H3 数量", protocol)
+        self.assertIn("baoyu-format-markdown/article-formatted.md", formatter)
+        self.assertIn("顶层独立 `baoyu-format-markdown/` workspace", protocol)
+
+    def test_typesetter_runs_gzh_naturally_and_leader_only_seals(self) -> None:
+        typesetter = (ROOT / "agents" / "wechat-typesetter.md").read_text(encoding="utf-8")
+        leader = (ROOT / "agents" / "wechat-leader.md").read_text(encoding="utf-8")
+        protocol = (ROOT / "docs" / "wechat-pipeline-protocol.md").read_text(encoding="utf-8")
+        skill_run = (ROOT / "scripts" / "skill_run.py").read_text(encoding="utf-8")
+        self.assertIn("--boundary layout start", typesetter)
+        self.assertIn("invocation_args", typesetter)
+        self.assertIn("主题、组件、结构和 HTML 均由 Skill 决定", typesetter)
+        self.assertNotIn("不新增作者介绍", typesetter)
+        self.assertIn("不要新增作者签名", skill_run)
+        self.assertIn("不写 canonical HTML", typesetter)
+        self.assertIn("started / attempt-1", typesetter)
+        self.assertIn("同一 gzh-design 上下文", typesetter)
+        self.assertIn("禁止", typesetter)
+        self.assertIn("prepare_layout.py", leader)
+        self.assertIn("只用宿主 wait/终态通知", leader)
+        self.assertIn("不提供 resume/attempt-2 活接口", protocol)
+        self.assertFalse((ROOT / "scripts" / "layout_skill_run.py").exists())
+        self.assertTrue((ROOT / "scripts" / "prepare_layout.py").is_file())
 
     def test_baoyu_snapshot_matches_lock(self) -> None:
         lock = json.loads(
@@ -164,6 +259,28 @@ class PluginStructureTests(unittest.TestCase):
             digest.update(contents)
         self.assertEqual(digest.hexdigest(), lock["tree_sha256"])
 
+    def test_release_integrity_detects_modified_installed_runtime(self) -> None:
+        current = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "integrity.py"), "validate", "--scope", "release"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(current.returncode, 0, current.stdout + current.stderr)
+        with tempfile.TemporaryDirectory() as temp:
+            copied = Path(temp) / "wechat-pipeline"
+            shutil.copytree(ROOT, copied, ignore=shutil.ignore_patterns(".in_use", "__pycache__", "*.pyc"))
+            leader = copied / "agents" / "wechat-leader.md"
+            leader.write_text(leader.read_text(encoding="utf-8") + "\nmodified\n", encoding="utf-8")
+            rejected = subprocess.run(
+                [sys.executable, str(copied / "scripts" / "integrity.py"), "validate", "--scope", "release"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("agents/wechat-leader.md", rejected.stdout)
+
     def test_repository_is_portable_and_contains_no_runtime_secrets(self) -> None:
         checked_suffixes = {".md", ".py", ".json", ".mjs", ".sh"}
         for path in REPO.rglob("*"):
@@ -203,7 +320,7 @@ class PluginStructureTests(unittest.TestCase):
         self.assertIn("/wechat-pipeline:wechat-pipeline-setup", readme)
         self.assertIn("$wechat-pipeline:wechat-pipeline-setup", readme)
         self.assertNotIn("`wechat-pipeline-doctor --mode", leader)
-        self.assertIn("${PIPELINE_ROOT}/scripts/plugin_doctor.py", leader)
+        self.assertIn("$PIPELINE_ROOT/scripts/plugin_doctor.py", leader)
 
     def test_embedded_publisher_newspic_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

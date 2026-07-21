@@ -34,6 +34,7 @@ def load_pipeline_snapshot(value: str | None, canonical: Path, mode: str) -> dic
         raise PublishError(f"publish snapshot validation failed: {detail}")
     try:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
+        run = json.loads((canonical / ".pipeline" / "run.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as err:
         raise PublishError(f"unable to read publish snapshot: {err}") from err
     if snapshot.get("mode") != mode:
@@ -43,6 +44,6 @@ def load_pipeline_snapshot(value: str | None, canonical: Path, mode: str) -> dic
         "sha256": sha256_file(path),
         "fingerprint": snapshot.get("fingerprint"),
         "account": snapshot.get("account"),
+        "run_status": run.get("status"),
         "data": snapshot,
     }
-

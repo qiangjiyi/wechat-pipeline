@@ -32,7 +32,7 @@ from lib.result_store import (
     sha256_file,
     write_receipt,
 )
-from lib.source_loader import load_source, validate_newspic_source
+from lib.source_loader import load_source, markdown_title, validate_newspic_source
 from lib.pipeline_snapshot import load_pipeline_snapshot
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -42,25 +42,15 @@ MANIFEST_VALIDATOR = PLUGIN_ROOT / "scripts" / "validate_designer_manifest.py"
 
 def _derive_title(text: str) -> str:
     """Derive the pipeline title without changing the sealed publication text."""
-    lines = text.splitlines()
-    if lines and lines[0].strip() == "---":
-        for index in range(1, len(lines)):
-            if lines[index].strip() == "---":
-                for raw in lines[1:index]:
-                    if raw.strip().startswith("title:"):
-                        return raw.split(":", 1)[1].strip().strip("\"'")
-                lines = lines[index + 1:]
-                break
-    for raw in lines:
-        value = raw.strip()
-        if value:
-            return value[2:].strip() if value.startswith("# ") else value
-    raise PublishError("sealed pipeline input does not contain a title")
+    value = markdown_title(text)
+    if not value:
+        raise PublishError("sealed pipeline input does not contain a title")
+    return value
 
 
 def _load_pipeline_manifest(args, result_path: Path | None) -> tuple[dict, Path, dict]:
     manifest_path = Path(args.manifest).expanduser().resolve()
-    command = [sys.executable, str(MANIFEST_VALIDATOR), str(manifest_path), "--phase", "publish-ready"]
+    command = [sys.executable, str(MANIFEST_VALIDATOR), str(manifest_path)]
     result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
     if result.returncode != 0:
         detail = (result.stdout or result.stderr).strip()
@@ -208,6 +198,9 @@ def _run(args) -> int:
             "verify_draft": verify_draft,
         }, ensure_ascii=False, indent=2))
         return 0
+
+    if manifest_binding and manifest_binding["snapshot"]["run_status"] != "publishing":
+        raise PublishError("real pipeline publishing requires run status publishing")
 
     if not args.yes:
         _confirm_newspic(account, title, content, images)

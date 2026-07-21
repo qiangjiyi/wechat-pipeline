@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
-"""Validate planning evidence or publish-ready image outputs."""
+"""Validate completed native artwork Skill runs and their returned images."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import struct
+import re
 import sys
-import zlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-
-from protocol_version import PROTOCOL_VERSION
 from typing import Any
 
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT))
 
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-ALLOWED_VERDICTS = {
-    "success",
-    "network_error",
-    "api_error",
-    "quota_error",
-    "empty_output",
-    "invalid_output",
-    "contract_error",
-}
-BACKEND_ALIASES = {
-    "imagegen": "openai-native",
-    "codex-image-gen": "codex-cli",
-}
+from image_contracts import skill_options, validate_output_contract
+from image_evidence import IMAGE_ROLES, validate_image_evidence
+from protocol_version import PROTOCOL_VERSION
+from shared.hashing import sha256_file
+from shared.jsonio import inside, load_json
+from shared.markdown_meta import split_frontmatter
+from skill_run import ALLOWED_ROLES, EXPECTED_SKILLS
+
+
+SKILLS_ROOT = PLUGIN_ROOT / "skills"
 REQUIRED_TOP_LEVEL = {
     "schema_version",
     "protocol_version",
@@ -37,318 +31,194 @@ REQUIRED_TOP_LEVEL = {
     "mode",
     "canonical_output_dir",
     "source",
-    "skill_contract",
-    "plan",
+    "skill_runs",
     "images",
 }
 REQUIRED_IMAGE_FIELDS = {
     "id",
     "kind",
-    "source_skill",
-    "prompt_path",
-    "prompt_sha256",
-    "prompt_written_at",
+    "source_skill_run_id",
     "output_path",
-    "aspect",
-    "attempts",
-    "status",
+    "output_sha256",
+    "evidence_path",
+    "evidence_sha256",
 }
-REQUIRED_ATTEMPT_FIELDS = {
-    "scope",
-    "backend",
-    "prompt_sha256",
-    "started_at",
-    "finished_at",
-    "verdict",
-    "error_summary",
-}
-MIN_PNG_BYTES = 4096
-MIN_DIMENSIONS = {
-    "card": (900, 1200),
-    "cover": (900, 380),
-    "body": (1200, 675),
-}
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def load_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def resolve_path(value: str, base_dir: Path) -> Path:
-    path = Path(value).expanduser()
-    return path.resolve() if path.is_absolute() else (base_dir / path).resolve()
 
 
 def parse_time(value: Any, label: str, errors: list[str]) -> datetime | None:
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         errors.append(f"invalid ISO-8601 timestamp for {label}: {value!r}")
         return None
-
-
-def _paeth(left: int, up: int, upper_left: int) -> int:
-    estimate = left + up - upper_left
-    left_distance = abs(estimate - left)
-    up_distance = abs(estimate - up)
-    upper_left_distance = abs(estimate - upper_left)
-    if left_distance <= up_distance and left_distance <= upper_left_distance:
-        return left
-    return up if up_distance <= upper_left_distance else upper_left
-
-
-def inspect_png(path: Path) -> tuple[tuple[int, int] | None, bool | None, list[str]]:
-    """Validate PNG chunks/pixels and report whether every visible pixel is identical."""
-    try:
-        payload = path.read_bytes()
-    except OSError as err:
-        return None, None, [f"unable to read PNG: {err}"]
-    if not payload.startswith(PNG_SIGNATURE):
-        return None, None, ["missing PNG signature"]
-
-    offset = len(PNG_SIGNATURE)
-    ihdr: bytes | None = None
-    idat: list[bytes] = []
-    saw_iend = False
-    errors: list[str] = []
-    while offset < len(payload):
-        if offset + 12 > len(payload):
-            errors.append("truncated PNG chunk header")
-            break
-        length = struct.unpack(">I", payload[offset:offset + 4])[0]
-        chunk_type = payload[offset + 4:offset + 8]
-        chunk_end = offset + 12 + length
-        if chunk_end > len(payload):
-            errors.append("truncated PNG chunk payload")
-            break
-        chunk_data = payload[offset + 8:offset + 8 + length]
-        recorded_crc = struct.unpack(">I", payload[offset + 8 + length:chunk_end])[0]
-        actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
-        if recorded_crc != actual_crc:
-            errors.append(f"invalid PNG CRC for {chunk_type.decode('ascii', errors='replace')}")
-        if chunk_type == b"IHDR":
-            if ihdr is not None or offset != len(PNG_SIGNATURE) or length != 13:
-                errors.append("PNG must begin with exactly one 13-byte IHDR chunk")
-            ihdr = chunk_data
-        elif chunk_type == b"IDAT":
-            idat.append(chunk_data)
-        elif chunk_type == b"IEND":
-            if length != 0:
-                errors.append("PNG IEND chunk must be empty")
-            saw_iend = True
-            offset = chunk_end
-            if offset != len(payload):
-                errors.append("PNG contains trailing bytes after IEND")
-            break
-        offset = chunk_end
-
-    if ihdr is None:
-        return None, None, errors + ["missing PNG IHDR chunk"]
-    width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(">IIBBBBB", ihdr)
-    dimensions = (width, height)
-    if width <= 0 or height <= 0:
-        errors.append("PNG dimensions must be positive")
-    if not idat:
-        errors.append("missing PNG IDAT data")
-    if not saw_iend:
-        errors.append("missing PNG IEND chunk")
-    if compression != 0 or filter_method != 0 or interlace not in {0, 1}:
-        errors.append("unsupported PNG compression, filter, or interlace method")
-    valid_depths = {
-        0: {1, 2, 4, 8, 16},
-        2: {8, 16},
-        3: {1, 2, 4, 8},
-        4: {8, 16},
-        6: {8, 16},
-    }
-    if bit_depth not in valid_depths.get(color_type, set()):
-        errors.append(f"unsupported PNG color type/bit depth: {color_type}/{bit_depth}")
-    if errors or interlace != 0:
-        return dimensions, None, errors
-
-    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
-    bits_per_pixel = channels * bit_depth
-    stride = (width * bits_per_pixel + 7) // 8
-    bytes_per_pixel = max(1, (bits_per_pixel + 7) // 8)
-    expected_size = height * (stride + 1)
-    if expected_size > 300 * 1024 * 1024:
-        return dimensions, None, ["PNG decoded pixel data exceeds the 300 MiB safety limit"]
-    try:
-        decoded = zlib.decompress(b"".join(idat))
-    except zlib.error as err:
-        return dimensions, None, [f"invalid PNG compressed pixel data: {err}"]
-    if len(decoded) != expected_size:
-        return dimensions, None, [
-            f"PNG decoded pixel length mismatch: expected {expected_size} got {len(decoded)}"
-        ]
-
-    rows: list[bytes] = []
-    prior = bytearray(stride)
-    cursor = 0
-    for row_index in range(height):
-        filter_type = decoded[cursor]
-        scanline = decoded[cursor + 1:cursor + 1 + stride]
-        cursor += stride + 1
-        if filter_type > 4:
-            return dimensions, None, [f"invalid PNG filter type {filter_type} on row {row_index}"]
-        restored = bytearray(stride)
-        for index, value in enumerate(scanline):
-            left = restored[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
-            up = prior[index]
-            upper_left = prior[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
-            predictor = (0, left, up, (left + up) // 2, _paeth(left, up, upper_left))[filter_type]
-            restored[index] = (value + predictor) & 0xFF
-        rows.append(bytes(restored))
-        prior = restored
-
-    flat: bool | None = None
-    if bit_depth in {8, 16} and color_type in {0, 2, 4, 6}:
-        pixel_size = channels * (bit_depth // 8)
-        first = rows[0][:pixel_size]
-        flat = all(
-            row[index:index + pixel_size] == first
-            for row in rows
-            for index in range(0, len(row), pixel_size)
-        )
-        if color_type in {4, 6}:
-            alpha_offset = (channels - 1) * (bit_depth // 8)
-            alpha_size = bit_depth // 8
-            if all(
-                row[index + alpha_offset:index + alpha_offset + alpha_size] == b"\x00" * alpha_size
-                for row in rows
-                for index in range(0, len(row), pixel_size)
-            ):
-                errors.append("PNG is fully transparent")
-    return dimensions, flat, errors
-
-
-def expected_ratio(value: str) -> float | None:
-    try:
-        width, height = value.split(":", 1)
-        ratio = float(width) / float(height)
-    except (ValueError, ZeroDivisionError):
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        errors.append(f"{label} must include an explicit timezone offset")
         return None
-    return ratio if ratio > 0 else None
+    return parsed
 
 
-def read_preferred_style(path: Path) -> str | None:
-    """Read the small preferred_style subset without requiring a YAML dependency."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    for index, raw_line in enumerate(lines):
-        stripped = raw_line.strip()
-        if not stripped.startswith("preferred_style:"):
-            continue
-        inline = stripped.split(":", 1)[1].strip().strip("\"'")
-        if inline and inline not in {"null", "~"}:
-            return inline
-        base_indent = len(raw_line) - len(raw_line.lstrip())
-        for child in lines[index + 1:]:
-            child_stripped = child.strip()
-            if not child_stripped or child_stripped.startswith("#"):
-                continue
-            child_indent = len(child) - len(child.lstrip())
-            if child_indent <= base_indent:
-                break
-            if child_stripped.startswith("name:"):
-                return child_stripped.split(":", 1)[1].strip().strip("\"'") or None
+def validate_binding(value: Any, label: str, canonical_dir: Path, errors: list[str]) -> Path | None:
+    if not isinstance(value, dict):
+        errors.append(f"{label} must be an object")
         return None
-    return None
+    path = Path(str(value.get("path", ""))).expanduser().resolve()
+    if not inside(path, canonical_dir):
+        errors.append(f"{label}.path must stay inside canonical_output_dir")
+    elif not path.is_file():
+        errors.append(f"{label}.path is missing: {path}")
+    elif path.stat().st_size == 0:
+        errors.append(f"{label}.path is empty: {path}")
+    elif value.get("sha256") != sha256_file(path):
+        errors.append(f"{label}.sha256 does not match its file")
+    return path
 
 
-def validate_source(manifest: dict, base_dir: Path, phase: str, errors: list[str]) -> None:
+def validate_source(manifest: dict, canonical_dir: Path, errors: list[str]) -> str | None:
     source = manifest.get("source")
     if not isinstance(source, dict):
         errors.append("manifest.source must be an object")
-        return
-    for key in ("original_path", "original_sha256"):
-        if not source.get(key):
-            errors.append(f"manifest.source missing field: {key}")
-    if not source.get("original_path"):
-        return
-    original_path = resolve_path(str(source["original_path"]), base_dir)
-    expected_input = (
-        Path(manifest.get("canonical_output_dir", "")).expanduser().resolve()
-        / ".pipeline"
-        / "input.md"
-    )
-    if original_path != expected_input:
-        errors.append(f"original_path must be the sealed run input: {expected_input}")
-    if not original_path.is_file():
-        errors.append(f"source original file not found: {original_path}")
-        return
-    actual_hash = sha256_file(original_path)
-    if actual_hash != source.get("original_sha256"):
-        errors.append(f"source original hash mismatch: expected {source.get('original_sha256')} got {actual_hash}")
-    if phase == "publish-ready":
-        adapter_hash = source.get("publisher_text_sha256")
-        if adapter_hash != actual_hash:
-            errors.append("publisher_text_sha256 must equal the sealed original input hash")
+        return None
+    expected = {
+        "original": canonical_dir / ".pipeline" / "input.md",
+        "content": canonical_dir / "content.md",
+    }
+    hashes: dict[str, str] = {}
+    for name, expected_path in expected.items():
+        actual = Path(str(source.get(f"{name}_path", ""))).expanduser().resolve()
+        if actual != expected_path:
+            errors.append(f"source.{name}_path must be {expected_path}")
+            continue
+        if not actual.is_file():
+            errors.append(f"source file is missing: {actual}")
+            continue
+        hashes[name] = sha256_file(actual)
+        if source.get(f"{name}_sha256") != hashes[name]:
+            errors.append(f"source.{name}_sha256 does not match {actual}")
+    if hashes.get("original") and source.get("publisher_text_sha256") != hashes["original"]:
+        errors.append("publisher_text_sha256 must equal the sealed original input hash")
+    return hashes.get("content")
 
 
-def validate_skill_contract(manifest: dict, base_dir: Path, errors: list[str]) -> None:
-    contract = manifest.get("skill_contract")
-    if not isinstance(contract, dict):
-        errors.append("manifest.skill_contract must be an object")
-        return
-    for key in ("skill_name", "skill_path", "skill_sha256", "files_read", "preferences"):
-        if key not in contract:
-            errors.append(f"manifest.skill_contract missing field: {key}")
-    skill_path_value = contract.get("skill_path")
-    if skill_path_value:
-        skill_path = resolve_path(str(skill_path_value), base_dir)
-        if not skill_path.is_file():
-            errors.append(f"skill file not found: {skill_path}")
-        elif sha256_file(skill_path) != contract.get("skill_sha256"):
-            errors.append("skill_sha256 does not match skill_path")
-    files_read = contract.get("files_read")
-    if not isinstance(files_read, list) or not files_read:
-        errors.append("skill_contract.files_read must be a non-empty list")
-    else:
-        for value in files_read:
-            path = resolve_path(str(value), base_dir)
-            if not path.is_file():
-                errors.append(f"declared skill/reference file not found: {path}")
-    preferences = contract.get("preferences")
-    if not isinstance(preferences, dict):
-        errors.append("skill_contract.preferences must be an object")
-        return
-    if preferences.get("source") not in {"user", "extend", "auto"}:
-        errors.append("preferences.source must be user, extend, or auto")
-    extend_path = preferences.get("extend_path")
-    extend_hash = preferences.get("extend_sha256")
-    if preferences.get("source") == "extend" and not extend_path:
-        errors.append("preferences.source=extend requires a non-empty extend_path")
-    if extend_path:
-        path = resolve_path(str(extend_path), base_dir)
-        if not path.is_file():
-            errors.append(f"EXTEND.md not found: {path}")
-        elif sha256_file(path) != extend_hash:
-            errors.append("extend_sha256 does not match extend_path")
-        elif preferences.get("source") == "extend":
-            preferred_style = read_preferred_style(path)
-            if preferred_style and preferences.get("style") != preferred_style:
-                errors.append(
-                    "resolved style does not match EXTEND.md preferred_style: "
-                    f"expected {preferred_style!r} got {preferences.get('style')!r}"
-                )
+def skill_frontmatter_name(path: Path) -> str | None:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    metadata, _ = split_frontmatter(text)
+    match = re.search(r"(?m)^name:\s*['\"]?([^'\"\s]+)", metadata)
+    return match.group(1) if match else None
+
+
+def validate_skill_runs(
+    manifest: dict,
+    canonical_dir: Path,
+    content_hash: str | None,
+    errors: list[str],
+) -> dict[str, dict]:
+    runs = manifest.get("skill_runs")
+    if not isinstance(runs, list):
+        errors.append("manifest.skill_runs must be a list")
+        return {}
+    by_id: dict[str, dict] = {}
+    names: set[str] = set()
+    for index, run in enumerate(runs, start=1):
+        label = f"skill_runs[{index}]"
+        if not isinstance(run, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        invocation_id = str(run.get("invocation_id", ""))
+        name = str(run.get("skill_name", ""))
+        if not invocation_id or invocation_id in by_id:
+            errors.append(f"{label}.invocation_id must be non-empty and unique")
+        else:
+            by_id[invocation_id] = run
+        names.add(name)
+        if run.get("schema_version") != 1:
+            errors.append(f"{label}.schema_version must be 1")
+        if run.get("protocol_version") != PROTOCOL_VERSION:
+            errors.append(f"{label}.protocol_version must be {PROTOCOL_VERSION}")
+        if run.get("run_id") != manifest.get("run_id"):
+            errors.append(f"{label}.run_id must match the manifest run")
+        expected_path = (SKILLS_ROOT / name / "SKILL.md").resolve()
+        actual_path = Path(str(run.get("skill_path", ""))).expanduser().resolve()
+        if actual_path != expected_path:
+            errors.append(f"{label}.skill_path must be the bundled {expected_path}")
+        elif not actual_path.is_file():
+            errors.append(f"{label}.skill_path is missing")
+        else:
+            if run.get("skill_sha256") != sha256_file(actual_path):
+                errors.append(f"{label}.skill_sha256 does not match the bundled Skill")
+            if skill_frontmatter_name(actual_path) != name:
+                errors.append(f"{label}.skill_name does not match SKILL.md frontmatter")
+        if run.get("skill_identifier") != f"wechat-pipeline:{name}":
+            errors.append(f"{label}.skill_identifier must name the plugin Skill")
+        if run.get("invocation_method") != "native-skill":
+            errors.append(f"{label}.invocation_method must be native-skill")
+        expected_options = skill_options(str(manifest.get("mode")), name)
+        if run.get("skill_options") != expected_options:
+            errors.append(f"{label}.skill_options must be {expected_options}")
+        if run.get("status") != "success":
+            errors.append(f"{label} did not complete successfully")
+        started = parse_time(run.get("started_at"), f"{label}.started_at", errors)
+        completed = parse_time(run.get("completed_at"), f"{label}.completed_at", errors)
+        if started and completed and completed < started:
+            errors.append(f"{label}.completed_at predates started_at")
+        if Path(str(run.get("input_path", ""))).expanduser().resolve() != canonical_dir / "content.md":
+            errors.append(f"{label}.input_path must bind canonical content.md")
+        if content_hash and run.get("input_sha256") != content_hash:
+            errors.append(f"{label}.input_sha256 must bind canonical content.md")
+        workspace = Path(str(run.get("workspace", ""))).expanduser().resolve()
+        expected_workspace = canonical_dir / invocation_id
+        if workspace != expected_workspace:
+            errors.append(f"{label}.workspace must be the direct Skill output directory {expected_workspace}")
+        elif not workspace.is_dir():
+            errors.append(f"{label}.workspace is missing")
+        outputs = run.get("returned_outputs")
+        if not isinstance(outputs, list) or not outputs:
+            errors.append(f"{label}.returned_outputs must contain the Skill's final results")
+            continue
+        seen: set[Path] = set()
+        for output_index, output in enumerate(outputs, start=1):
+            output_label = f"{label}.returned_outputs[{output_index}]"
+            if not isinstance(output, dict):
+                errors.append(f"{output_label} must be an object")
+                continue
+            role = str(output.get("role", ""))
+            if role not in ALLOWED_ROLES.get(name, set()):
+                errors.append(f"{output_label}.role is not a final result of {name}")
+            path = validate_binding(output, output_label, canonical_dir, errors)
+            if role in IMAGE_ROLES:
+                evidence_path = Path(str(output.get("evidence_path", ""))).expanduser().resolve()
+                if not output.get("evidence_path"):
+                    errors.append(f"{output_label} must carry proof-of-execution evidence")
+                elif not evidence_path.is_file():
+                    errors.append(f"{output_label}.evidence_path is missing: {evidence_path}")
+                elif output.get("evidence_sha256") != sha256_file(evidence_path):
+                    errors.append(f"{output_label}.evidence_sha256 does not match its file")
+                elif path is not None and started is not None:
+                    for issue in validate_image_evidence(evidence_path, path, workspace, started):
+                        errors.append(f"{output_label}: {issue}")
+            if path is not None:
+                if not inside(path, workspace):
+                    errors.append(f"{output_label}.path must stay inside its Skill workspace")
+                if path in seen:
+                    errors.append(f"{output_label}.path is duplicated")
+                seen.add(path)
+    expected = EXPECTED_SKILLS.get(str(manifest.get("mode")))
+    expected_names = set(expected) if expected is not None else None
+    if expected_names is None:
+        errors.append(f"manifest.mode must be newspic or news, got {manifest.get('mode')!r}")
+    elif names != expected_names or len(runs) != len(expected_names):
+        errors.append(
+            f"native Skill runs must be exactly once each: {sorted(expected_names)}, "
+            f"got {len(runs)} run(s) named {sorted(names)}"
+        )
+    return by_id
 
 
 def validate_image(
     image: Any,
     index: int,
-    base_dir: Path,
+    mode: str,
     canonical_dir: Path,
-    phase: str,
-    configured_backends: set[str],
+    skill_runs: dict[str, dict],
     errors: list[str],
 ) -> None:
     label = f"images[{index}]"
@@ -359,184 +229,97 @@ def validate_image(
     if missing:
         errors.append(f"{label} missing fields: {sorted(missing)}")
         return
-
-    prompt_path = resolve_path(str(image["prompt_path"]), base_dir)
-    output_path = resolve_path(str(image["output_path"]), base_dir)
-    if canonical_dir not in prompt_path.parents:
-        errors.append(f"{label}.prompt_path must stay inside canonical_output_dir")
-    if canonical_dir not in output_path.parents:
+    output_path = Path(str(image["output_path"])).expanduser().resolve()
+    if not inside(output_path, canonical_dir):
         errors.append(f"{label}.output_path must stay inside canonical_output_dir")
-    if not prompt_path.is_file():
-        errors.append(f"prompt not found: {prompt_path}")
-        prompt_hash = None
-    else:
-        prompt_hash = sha256_file(prompt_path)
-        if prompt_hash != image["prompt_sha256"]:
-            errors.append(f"prompt hash mismatch: {prompt_path}")
-
-    prompt_written_at = parse_time(image["prompt_written_at"], f"{label}.prompt_written_at", errors)
-    if prompt_path.is_file() and prompt_written_at:
-        actual_written_at = datetime.fromtimestamp(prompt_path.stat().st_mtime, tz=prompt_written_at.tzinfo)
-        if actual_written_at > prompt_written_at + timedelta(seconds=5):
-            errors.append(f"{label}.prompt_written_at predates the prompt file modification time")
-    attempts = image.get("attempts")
-    if not isinstance(attempts, list):
-        errors.append(f"{label}.attempts must be a list")
-        attempts = []
-
-    previous_finished: datetime | None = None
-    for attempt_index, attempt in enumerate(attempts, start=1):
-        attempt_label = f"{label}.attempts[{attempt_index}]"
-        if not isinstance(attempt, dict):
-            errors.append(f"{attempt_label} must be an object")
-            continue
-        missing_attempt = REQUIRED_ATTEMPT_FIELDS - set(attempt)
-        if missing_attempt:
-            errors.append(f"{attempt_label} missing fields: {sorted(missing_attempt)}")
-            continue
-        if attempt.get("scope") != "image":
-            errors.append(f"{attempt_label}.scope must be image; preflight attempts belong in preflight.json")
-        if attempt.get("verdict") not in ALLOWED_VERDICTS:
-            errors.append(f"{attempt_label} invalid verdict: {attempt.get('verdict')!r}")
-        backend = str(attempt.get("backend", ""))
-        canonical_backend = BACKEND_ALIASES.get(backend, backend)
-        if canonical_backend == "placeholder":
-            errors.append(f"{attempt_label}.backend placeholder is never publishable")
-        if canonical_backend not in configured_backends:
-            errors.append(
-                f"{attempt_label}.backend was not configured by preflight: {backend!r}"
-            )
-        if attempt.get("prompt_sha256") != image.get("prompt_sha256"):
-            errors.append(f"{attempt_label}.prompt_sha256 does not match the image prompt")
-        started = parse_time(attempt.get("started_at"), f"{attempt_label}.started_at", errors)
-        finished = parse_time(attempt.get("finished_at"), f"{attempt_label}.finished_at", errors)
-        if started and prompt_written_at and started < prompt_written_at:
-            errors.append(f"{attempt_label} started before its prompt was written")
-        if started and finished and finished < started:
-            errors.append(f"{attempt_label} finished before it started")
-        if started and previous_finished and started < previous_finished:
-            errors.append(f"{attempt_label} overlaps or precedes the previous attempt")
-        if finished:
-            previous_finished = finished
-
-    if phase == "plan":
         return
-    if image.get("status") != "success":
-        errors.append(f"{label} is not publish-ready: status={image.get('status')!r}")
-    if not attempts or attempts[-1].get("verdict") != "success":
-        errors.append(f"{label} last attempt must have verdict success")
     if not output_path.is_file():
-        errors.append(f"output PNG not found: {output_path}")
+        errors.append(f"{label}.output_path is missing: {output_path}")
+        return
+    if sha256_file(output_path) != image.get("output_sha256"):
+        errors.append(f"{label}.output_sha256 mismatch")
+    evidence_path = Path(str(image.get("evidence_path", ""))).expanduser().resolve()
+    if not evidence_path.is_file():
+        errors.append(f"{label}.evidence_path is missing: {evidence_path}")
+    elif image.get("evidence_sha256") != sha256_file(evidence_path):
+        errors.append(f"{label}.evidence_sha256 mismatch")
+    invocation_id = str(image.get("source_skill_run_id", ""))
+    skill_run = skill_runs.get(invocation_id)
+    if skill_run is None:
+        errors.append(f"{label}.source_skill_run_id does not reference a completed Skill run")
     else:
-        if output_path.stat().st_size < MIN_PNG_BYTES:
-            errors.append(
-                f"output PNG is too small to be a publishable image: {output_path.stat().st_size} bytes"
+        returned = {
+            (
+                str(value.get("role", "")),
+                str(Path(str(value.get("path", ""))).expanduser().resolve()),
+                value.get("sha256"),
             )
-        if sha256_file(output_path) != image.get("output_sha256"):
-            errors.append(f"output hash mismatch: {output_path}")
-        dimensions, flat, png_errors = inspect_png(output_path)
-        errors.extend(f"invalid output PNG {output_path}: {error}" for error in png_errors)
-        if flat:
-            errors.append(f"output PNG is a single-color blank image: {output_path}")
-        ratio = expected_ratio(str(image.get("aspect", "")))
-        if dimensions is None:
-            errors.append(f"output PNG is missing a valid IHDR dimension header: {output_path}")
-        elif ratio is None:
-            errors.append(f"{label}.aspect must use a positive width:height ratio")
+            for value in skill_run.get("returned_outputs", [])
+            if isinstance(value, dict)
+        }
+        expected = (str(image.get("kind", "")), str(output_path), image.get("output_sha256"))
+        if expected not in returned:
+            errors.append(f"{label} is not a final output returned by its native Skill run")
         else:
-            actual = dimensions[0] / dimensions[1]
-            if abs(actual - ratio) / ratio > 0.03:
-                errors.append(
-                    f"{label} dimensions {dimensions[0]}x{dimensions[1]} do not match aspect {image.get('aspect')}"
-                )
-            mode = str((load_json(canonical_dir / ".pipeline" / "run.json")).get("mode", ""))
-            kind = str(image.get("kind", ""))
-            dimension_key = "card" if mode == "newspic" else ("cover" if kind == "cover" else "body")
-            minimum = MIN_DIMENSIONS[dimension_key]
-            if dimensions[0] < minimum[0] or dimensions[1] < minimum[1]:
-                errors.append(
-                    f"{label} dimensions {dimensions[0]}x{dimensions[1]} are below minimum {minimum[0]}x{minimum[1]}"
-                )
+            matched = next(
+                value
+                for value in skill_run.get("returned_outputs", [])
+                if isinstance(value, dict)
+                and str(Path(str(value.get("path", ""))).expanduser().resolve()) == str(output_path)
+            )
+            receipt_evidence = str(Path(str(matched.get("evidence_path", ""))).expanduser().resolve())
+            if not matched.get("evidence_path") or receipt_evidence != str(evidence_path):
+                errors.append(f"{label}.evidence_path does not match its Skill run receipt")
+        for contract_error in validate_output_contract(
+            mode,
+            str(skill_run.get("skill_name", "")),
+            str(image.get("kind", "")),
+            output_path,
+        ):
+            errors.append(f"{label}: {contract_error}")
 
 
-def validate_mode_contract(manifest: dict, errors: list[str]) -> None:
-    mode = manifest.get("mode")
-    images = manifest.get("images") if isinstance(manifest.get("images"), list) else []
-    plan = manifest.get("plan") if isinstance(manifest.get("plan"), dict) else {}
-    if plan.get("image_count") != len(images):
-        errors.append("plan.image_count must equal the number of manifest images")
-    if mode == "newspic":
-        if not 1 <= len(images) <= 20:
-            errors.append("newspic requires 1-20 card images")
-        if plan.get("card_count") != len(images):
-            errors.append("newspic plan.card_count must equal the number of images")
-        for index, image in enumerate(images, start=1):
-            if not isinstance(image, dict):
-                continue
-            if image.get("kind") != "card":
-                errors.append(f"images[{index}].kind must be card in newspic mode")
-            if image.get("source_skill") != "baoyu-xhs-images":
-                errors.append(f"images[{index}].source_skill must be baoyu-xhs-images")
-            if image.get("aspect") != "3:4":
-                errors.append(f"images[{index}].aspect must be 3:4 in newspic mode")
-    elif mode == "news":
-        covers = [image for image in images if isinstance(image, dict) and image.get("kind") == "cover"]
-        bodies = [image for image in images if isinstance(image, dict) and image.get("kind") != "cover"]
-        if len(covers) != 1:
-            errors.append("news requires exactly one cover image")
-        if not bodies:
-            errors.append("news requires at least one body illustration")
-        if plan.get("cover_count") != 1 or plan.get("body_count") != len(bodies):
-            errors.append("news plan counts must declare one cover and every body illustration")
-        for index, image in enumerate(images, start=1):
-            if not isinstance(image, dict):
-                continue
-            if image.get("kind") == "cover":
-                if image.get("source_skill") != "baoyu-cover-image":
-                    errors.append(f"images[{index}] cover must come from baoyu-cover-image")
-                if image.get("aspect") != "2.35:1":
-                    errors.append(f"images[{index}] cover aspect must be 2.35:1")
-            else:
-                if image.get("kind") not in {"inline", "scene"}:
-                    errors.append(f"images[{index}].kind must be inline or scene for a news body image")
-                if image.get("source_skill") != "baoyu-article-illustrator":
-                    errors.append(f"images[{index}] body image must come from baoyu-article-illustrator")
-                if image.get("aspect") != "16:9":
-                    errors.append(f"images[{index}] body image aspect must be 16:9")
-    else:
-        errors.append(f"manifest.mode must be newspic or news, got {mode!r}")
+def validate_mode_results(manifest: dict, canonical_dir: Path, errors: list[str]) -> None:
+    images = [value for value in manifest.get("images", []) if isinstance(value, dict)]
+    kinds = [str(value.get("kind", "")) for value in images]
+    if manifest.get("mode") == "newspic":
+        if not images or any(kind != "card" for kind in kinds):
+            errors.append("newspic requires final card results returned by baoyu-xhs-images")
+        if "layout_input" in manifest:
+            errors.append("newspic manifest must not declare layout_input")
+    elif manifest.get("mode") == "news":
+        if kinds.count("cover") != 1:
+            errors.append("news requires one selected cover returned by baoyu-cover-image")
+        if kinds.count("body") < 1 or any(kind not in {"cover", "body"} for kind in kinds):
+            errors.append("news requires at least one body image returned by baoyu-article-illustrator")
+        layout_path = validate_binding(manifest.get("layout_input"), "layout_input", canonical_dir, errors)
+        illustrator = next(
+            (run for run in manifest.get("skill_runs", []) if isinstance(run, dict) and run.get("skill_name") == "baoyu-article-illustrator"),
+            None,
+        )
+        if layout_path is not None and illustrator is not None:
+            returned_articles = {
+                (str(Path(str(value.get("path", ""))).expanduser().resolve()), value.get("sha256"))
+                for value in illustrator.get("returned_outputs", [])
+                if isinstance(value, dict) and value.get("role") == "article"
+            }
+            if (str(layout_path), manifest.get("layout_input", {}).get("sha256")) not in returned_articles:
+                errors.append("layout_input must be the final illustrated article returned by baoyu-article-illustrator")
 
 
-def validate(manifest_path: Path, phase: str) -> list[str]:
+def validate(manifest_path: Path) -> list[str]:
     errors: list[str] = []
     manifest = load_json(manifest_path)
-    if not isinstance(manifest, dict):
-        return ["manifest root must be an object"]
-    base_dir = manifest_path.parent
     missing = REQUIRED_TOP_LEVEL - set(manifest)
     if missing:
         errors.append(f"manifest missing top-level fields: {sorted(missing)}")
+    if manifest.get("schema_version") != 5:
+        errors.append("manifest.schema_version must be 5")
     if manifest.get("protocol_version") != PROTOCOL_VERSION:
         errors.append(f"protocol_version must be {PROTOCOL_VERSION}")
-
     canonical_dir = Path(str(manifest.get("canonical_output_dir", ""))).expanduser().resolve()
-    configured_backends: set[str] = set()
-    preflight_path = canonical_dir / ".pipeline" / "preflight.json"
-    if not preflight_path.is_file():
-        errors.append(f"image backend preflight not found: {preflight_path}")
-    else:
-        try:
-            preflight = load_json(preflight_path)
-            configured_backends = {
-                str(value) for value in preflight.get("fallback_order", []) if value
-            }
-        except (OSError, ValueError) as err:
-            errors.append(f"unable to read image backend preflight: {err}")
-        if not configured_backends:
-            errors.append("preflight fallback_order must contain at least one configured backend")
-    expected_manifest = canonical_dir / ".pipeline" / "manifest.json"
-    if manifest_path != expected_manifest:
-        errors.append(f"manifest must live at {expected_manifest}")
+    if manifest_path != canonical_dir / ".pipeline" / "manifest.json":
+        errors.append("manifest must live at <canonical_output_dir>/.pipeline/manifest.json")
     run_path = canonical_dir / ".pipeline" / "run.json"
     if not run_path.is_file():
         errors.append(f"run context not found: {run_path}")
@@ -544,63 +327,48 @@ def validate(manifest_path: Path, phase: str) -> list[str]:
         run = load_json(run_path)
         if run.get("run_id") != manifest.get("run_id"):
             errors.append("run_id does not match run.json")
-        run_canonical = Path(str(run.get("canonical_output_dir", ""))).expanduser().resolve()
-        if run_canonical != canonical_dir:
+        if run.get("mode") != manifest.get("mode"):
+            errors.append("mode does not match run.json")
+        if Path(str(run.get("canonical_output_dir", ""))).expanduser().resolve() != canonical_dir:
             errors.append("canonical_output_dir does not match run.json")
-
-    validate_source(manifest, base_dir, phase, errors)
-    validate_skill_contract(manifest, base_dir, errors)
-    validate_mode_contract(manifest, errors)
+    content_hash = validate_source(manifest, canonical_dir, errors)
+    skill_runs = validate_skill_runs(manifest, canonical_dir, content_hash, errors)
     images = manifest.get("images")
     if not isinstance(images, list) or not images:
         errors.append("manifest.images must be a non-empty list")
     else:
-        ids = [str(image.get("id", "")) for image in images if isinstance(image, dict)]
-        prompt_paths = [str(image.get("prompt_path", "")) for image in images if isinstance(image, dict)]
-        output_paths = [str(image.get("output_path", "")) for image in images if isinstance(image, dict)]
+        ids = [str(value.get("id", "")) for value in images if isinstance(value, dict)]
+        paths = [str(value.get("output_path", "")) for value in images if isinstance(value, dict)]
         if len(ids) != len(set(ids)):
             errors.append("manifest image IDs must be unique")
-        if len(prompt_paths) != len(set(prompt_paths)):
-            errors.append("manifest prompt paths must be unique")
-        if len(output_paths) != len(set(output_paths)):
-            errors.append("manifest output paths must be unique")
+        if len(paths) != len(set(paths)):
+            errors.append("manifest image paths must be unique")
         for index, image in enumerate(images, start=1):
             validate_image(
-                image,
-                index,
-                base_dir,
-                canonical_dir,
-                phase,
-                configured_backends,
-                errors,
+                image, index, str(manifest.get("mode", "")), canonical_dir, skill_runs, errors
             )
-        if phase == "publish-ready":
-            output_hashes = [
-                str(image.get("output_sha256", ""))
-                for image in images
-                if isinstance(image, dict) and image.get("output_sha256")
-            ]
-            if len(output_hashes) != len(set(output_hashes)):
-                errors.append("manifest contains duplicate rendered image files")
+    validate_mode_results(manifest, canonical_dir, errors)
     return errors
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--phase", choices=("plan", "publish-ready"), default="publish-ready")
     args = parser.parse_args()
     manifest_path = args.manifest.expanduser().resolve()
     if not manifest_path.is_file():
         print(f"ERROR: manifest not found: {manifest_path}", file=sys.stderr)
         return 2
-    errors = validate(manifest_path, args.phase)
+    try:
+        errors = validate(manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as err:
+        errors = [f"unable to validate manifest: {err}"]
     if errors:
-        print(f"designer manifest validation failed ({args.phase}):")
+        print("designer manifest validation failed:")
         for error in errors:
             print(f"- {error}")
         return 1
-    print(f"designer manifest validation passed ({args.phase}): {manifest_path}")
+    print(f"designer manifest validation passed: {manifest_path}")
     return 0
 
 

@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 from argparse import Namespace
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -473,20 +474,38 @@ class PublisherInputTests(unittest.TestCase):
             original.write_text("# 标题\n\n正文。\n", encoding="utf-8")
             markdown = run_dir / "content.md"
             markdown.write_bytes(original.read_bytes())
+            typesetting_at = datetime.now(timezone.utc)
+            (pipeline / "events.jsonl").write_text(
+                json.dumps({
+                    "event": "status.changed",
+                    "occurred_at": typesetting_at.isoformat(),
+                    "details": {"to": "typesetting"},
+                }) + "\n",
+                encoding="utf-8",
+            )
             article = run_dir / "article-body.html"
             article.write_text(
                 '<section><p><span leaf="">正文。</span></p></section>', encoding="utf-8"
             )
-            cover = run_dir / "cover.png"
+            images = run_dir / "images"
+            images.mkdir()
+            cover = images / "cover.png"
             cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
             (pipeline / "manifest.json").write_text(
-                json.dumps({"images": [{"id": "00", "kind": "cover", "output_path": str(cover)}]}),
+                json.dumps({
+                    "layout_input": {
+                        "path": str(markdown),
+                        "sha256": hashlib.sha256(markdown.read_bytes()).hexdigest(),
+                    },
+                    "images": [{"id": "00", "kind": "cover", "output_path": str(cover)}],
+                }),
                 encoding="utf-8",
             )
             run = {
-                "protocol_version": "2026-07-18-001",
+                "protocol_version": "2026-07-20-001",
                 "run_id": "run",
                 "canonical_output_dir": str(run_dir),
+                "status": "typesetting",
             }
             (pipeline / "run.json").write_text(json.dumps(run), encoding="utf-8")
             gzh = ROOT / "skills" / "gzh-design"
@@ -494,9 +513,31 @@ class PublisherInputTests(unittest.TestCase):
                 (ROOT / "third_party" / "gzh-design.lock.json").read_text(encoding="utf-8")
             )
             sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            native_workspace = run_dir / "gzh-design"
+            native_workspace.mkdir(parents=True)
+            native_html = native_workspace / "natural.html"
+            native_html.write_bytes(article.read_bytes())
+            layout_skill_run = {
+                "schema_version": 1,
+                "protocol_version": "2026-07-20-001",
+                "run_id": "run",
+                "skill_identifier": "wechat-pipeline:gzh-design",
+                "skill_path": str(gzh / "SKILL.md"),
+                "skill_sha256": sha(gzh / "SKILL.md"),
+                "invocation_method": "native-skill",
+                "input_path": str(markdown),
+                "input_sha256": sha(markdown),
+                "workspace": str(native_workspace),
+                "status": "success",
+                "returned_output": {
+                    "path": str(native_html), "sha256": sha(native_html),
+                },
+            }
+            layout_skill_run_path = pipeline / "layout-skill-run.json"
+            layout_skill_run_path.write_text(json.dumps(layout_skill_run), encoding="utf-8")
             layout = {
                 "schema_version": 1,
-                "protocol_version": "2026-07-18-001",
+                "protocol_version": "2026-07-20-001",
                 "run_id": "run",
                 "mode": "news",
                 "canonical_output_dir": str(run_dir),
@@ -506,24 +547,22 @@ class PublisherInputTests(unittest.TestCase):
                     "original_path": str(original),
                     "original_sha256": sha(original),
                 },
+                "skill_run": {
+                    "path": str(layout_skill_run_path),
+                    "sha256": sha(layout_skill_run_path),
+                },
                 "skill_contract": {
                     "skill_name": "gzh-design",
+                    "skill_identifier": "wechat-pipeline:gzh-design",
                     "skill_path": str(gzh / "SKILL.md"),
                     "skill_sha256": sha(gzh / "SKILL.md"),
                     "tree_sha256": lock["tree_sha256"],
-                    "files_read": [
-                        str(gzh / "SKILL.md"),
-                        str(gzh / "references" / "theme-index.md"),
-                        str(gzh / "references" / "theme-moyu-green.md"),
-                        str(gzh / "references" / "common-components.md"),
-                    ],
                     "upstream_commit": lock["commit"],
+                    "invocation_method": "native-skill",
                 },
                 "decision": {
-                    "theme": "摸鱼绿",
-                    "theme_source": "auto",
-                    "article_type": "观点/深度分析",
                     "content_policy": "preserve-visible-text",
+                    "engagement_footer_policy": "no-generated-engagement-footer",
                 },
                 "metadata": {
                     "title": "Manifest title",
@@ -534,7 +573,9 @@ class PublisherInputTests(unittest.TestCase):
                 "output": {
                     "html_path": str(article),
                     "html_sha256": sha(article),
-                    "generated_at": "2026-07-12T00:00:00+08:00",
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "native_output_path": str(native_html),
+                    "native_output_sha256": sha(native_html),
                 },
             }
             layout_path = pipeline / "layout.json"
