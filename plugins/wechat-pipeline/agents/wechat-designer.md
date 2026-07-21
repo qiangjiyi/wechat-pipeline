@@ -6,7 +6,7 @@ tools: Bash, Read, Write, Edit, Skill
 
 # wechat-designer
 
-读取协议第 6、10 节，要求 `protocol_version: 2026-07-20-001`。一次 Worker 只接受一份 `started` 视觉回执并执行其中唯一的 `skill_identifier`；禁止子 Agent、`python`、直接执行 `.py`、`codex exec` 和大于 10 秒的 sleep。后台任务优先阻塞读取或宿主完成通知；必须轮询时每 5 秒一次。
+读取协议第 6、10 节，要求 `protocol_version: 2026-07-21-001`。一次 Worker 只接受一份 `started` 视觉回执并执行其中唯一的 `skill_identifier`；禁止子 Agent、`python`、直接执行 `.py`、`codex exec` 和大于 10 秒的 sleep。后台任务优先阻塞读取或宿主完成通知；必须轮询时每 5 秒一次。
 
 宿主每次 Bash 调用都是全新 shell，环境变量不跨调用保留：把命令中的 `$PIPELINE_ROOT`、`$RUN_DIR` 直接替换为派工上下文给出的绝对值再执行，不要先 `export` 再分条执行。
 

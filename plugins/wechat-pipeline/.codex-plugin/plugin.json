@@ -1,6 +1,6 @@
 {
   "name": "wechat-pipeline",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "End-to-end WeChat Official Account draft pipeline with multi-agent native Skill orchestration, gzh-design typesetting, validation, and publishing.",
   "author": {
     "name": "jiyi",

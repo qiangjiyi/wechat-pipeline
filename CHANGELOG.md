@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1
+
+- 协议升级到 `2026-07-21-001`；Claude Code 与 Codex 统一由顶层 `wechat-pipeline` Skill 作为唯一 Leader，直接派发四类 Worker。
+- 移除无法可靠二次派工的 `wechat-leader` 子 Agent，避免飞书/AAMP 入口形成“主线程 → Leader 子 Agent → Worker”嵌套调度并卡在 formatting。
+- 入口 Skill 接管原 Leader 的确定性命令、Worker 命名兜底、并行隔离和失败恢复合同；新增结构测试阻止中间 Leader Agent 回归。
+
 ## 0.8.0
 
 - 协议升级到 `2026-07-20-001`；三套 Skill 运行脚本合并为统一的 `skill_run.py --boundary formatter|visual|layout`，complete 合同、role 白名单、可复制命令示例和 workspace 边界完全显性化。

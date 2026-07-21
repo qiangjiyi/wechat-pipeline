@@ -6,7 +6,7 @@ tools: Bash, Read, Write, Edit, Skill
 
 # wechat-formatter
 
-读取协议第 5、10 节，要求 `protocol_version: 2026-07-20-001`。只在 `formatting` 工作；禁止子 Agent、sequential-thinking、`python`、直接执行 `.py`、`codex exec` 和大于 10 秒的 sleep。
+读取协议第 5、10 节，要求 `protocol_version: 2026-07-21-001`。只在 `formatting` 工作；禁止子 Agent、sequential-thinking、`python`、直接执行 `.py`、`codex exec` 和大于 10 秒的 sleep。
 
 宿主每次 Bash 调用都是全新 shell，环境变量不跨调用保留：把命令中的 `$PIPELINE_ROOT`、`$RUN_DIR` 直接替换为派工上下文给出的绝对值再执行，不要先 `export` 再分条执行。
 

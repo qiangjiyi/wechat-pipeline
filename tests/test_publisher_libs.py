@@ -502,7 +502,7 @@ class PublisherInputTests(unittest.TestCase):
                 encoding="utf-8",
             )
             run = {
-                "protocol_version": "2026-07-20-001",
+                "protocol_version": "2026-07-21-001",
                 "run_id": "run",
                 "canonical_output_dir": str(run_dir),
                 "status": "typesetting",
@@ -519,7 +519,7 @@ class PublisherInputTests(unittest.TestCase):
             native_html.write_bytes(article.read_bytes())
             layout_skill_run = {
                 "schema_version": 1,
-                "protocol_version": "2026-07-20-001",
+                "protocol_version": "2026-07-21-001",
                 "run_id": "run",
                 "skill_identifier": "wechat-pipeline:gzh-design",
                 "skill_path": str(gzh / "SKILL.md"),
@@ -537,7 +537,7 @@ class PublisherInputTests(unittest.TestCase):
             layout_skill_run_path.write_text(json.dumps(layout_skill_run), encoding="utf-8")
             layout = {
                 "schema_version": 1,
-                "protocol_version": "2026-07-20-001",
+                "protocol_version": "2026-07-21-001",
                 "run_id": "run",
                 "mode": "news",
                 "canonical_output_dir": str(run_dir),

@@ -846,7 +846,7 @@ class PipelineScriptTests(unittest.TestCase):
                 json.dumps({
                     "schema_version": 1,
                     "ok": True,
-                    "protocol_version": "2026-07-20-001",
+                    "protocol_version": "2026-07-21-001",
                     "run_id": run["run_id"],
                     "mode": "newspic",
                     "account": "xiyue",
@@ -910,7 +910,7 @@ class PipelineScriptTests(unittest.TestCase):
             run_path.write_text(json.dumps(run), encoding="utf-8")
             receipt = {
                 "schema_version": 1,
-                "protocol_version": "2026-07-20-001",
+                "protocol_version": "2026-07-21-001",
                 "run_id": run["run_id"],
                 "mode": "newspic",
                 "account": "xiyue",
@@ -1068,7 +1068,7 @@ class PipelineScriptTests(unittest.TestCase):
         started = datetime.now(timezone.utc)
         completed = started - timedelta(seconds=1) if attempt_before_prompt else started + timedelta(seconds=1)
         run = {
-            "protocol_version": "2026-07-20-001",
+            "protocol_version": "2026-07-21-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "account": "xiyue",
@@ -1080,7 +1080,7 @@ class PipelineScriptTests(unittest.TestCase):
         (pipeline / "run.json").write_text(json.dumps(run), encoding="utf-8")
         skill_run = {
             "schema_version": 1,
-            "protocol_version": "2026-07-20-001",
+            "protocol_version": "2026-07-21-001",
             "run_id": "sample-run",
             "invocation_id": "baoyu-xhs-images",
             "skill_name": "baoyu-xhs-images",
@@ -1106,7 +1106,7 @@ class PipelineScriptTests(unittest.TestCase):
         }
         manifest = {
             "schema_version": 5,
-            "protocol_version": "2026-07-20-001",
+            "protocol_version": "2026-07-21-001",
             "run_id": "sample-run",
             "mode": "newspic",
             "canonical_output_dir": str(run_dir),
@@ -1795,7 +1795,7 @@ class PipelineScriptTests(unittest.TestCase):
             snapshot_path = pipeline / "publish-snapshot.json"
             snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
             receipt = {
-                "schema_version": 1, "protocol_version": "2026-07-20-001",
+                "schema_version": 1, "protocol_version": "2026-07-21-001",
                 "run_id": run["run_id"], "ok": True, "mode": "article-html", "account": "xiyue",
                 "publish_fingerprint": "f" * 64, "draft_media_id": "draft-news",
                 "creation_status": "created", "snapshot_sha256": sha256(snapshot_path),
@@ -1891,7 +1891,7 @@ class PipelineScriptTests(unittest.TestCase):
         native_html.write_bytes(html_path.read_bytes())
         skill_receipt = {
             "schema_version": 1,
-            "protocol_version": "2026-07-20-001",
+            "protocol_version": "2026-07-21-001",
             "run_id": run["run_id"],
             "attempt": 1,
             "skill_name": "gzh-design",
@@ -1913,7 +1913,7 @@ class PipelineScriptTests(unittest.TestCase):
         skill_receipt_path.write_text(json.dumps(skill_receipt), encoding="utf-8")
         layout = {
             "schema_version": 1,
-            "protocol_version": "2026-07-20-001",
+            "protocol_version": "2026-07-21-001",
             "run_id": run["run_id"],
             "mode": "news",
             "canonical_output_dir": str(run_dir),
